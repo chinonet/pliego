@@ -92,7 +92,7 @@ export function installFontFaces(faces: ShelfFace[], aliases: Array<{ face: Shel
     urls.add(url);
     const safe = family.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     rules.push(
-      `@font-face{font-family:"${safe}";src:url("${url}") format("truetype");font-weight:${face.weight};font-style:${face.style};font-display:swap;}`
+      `@font-face{font-family:"${safe}";src:url("${url}") format("truetype");font-weight:${face.weight};font-style:${face.style};font-display:swap;}`,
     );
   }
   let style = document.getElementById(STYLE_ID) as HTMLStyleElement | null;
