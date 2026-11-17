@@ -29,7 +29,7 @@ function chunk(type, data) {
   return Buffer.concat([len, name, data, crc]);
 }
 
-/** Trama fina + barras + círculo. Si el PDF la suaviza, hubo recompresión. */
+/** Trama fina + barras + círculo. Si el PDF la suaviza, hubo recompressión. */
 function makePng(w, h) {
   const raw = Buffer.alloc((w * 4 + 1) * h);
   const cx = Math.round(w * 0.72);
