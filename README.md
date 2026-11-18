@@ -7,6 +7,10 @@ Convierte un Word (.docx) en un PDF para premedia, en el navegador.
 - No vuelve a comprimir las imágenes.
 - Incrusta las fuentes completas que ya trae la app (Calibri, Cambria, Arial, Times New Roman, Courier New y Tahoma).
 
+## Deploy
+
+En el VPS corre en https://pliego.srv1165239.hstgr.cloud; cómo instalarlo y actualizarlo está en [deploy/README.md](deploy/README.md).
+
 ## Uso
 
 ```bash

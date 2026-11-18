@@ -10,3 +10,4 @@ dist
 .node_modules.lock
 artifacts
 screenshots
+!.env.example
