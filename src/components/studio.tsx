@@ -476,7 +476,7 @@ export function Studio() {
             <Upload className="size-5 text-accent" aria-hidden="true" />
             <p className="mt-3 text-sm font-semibold">Suelta el .docx de imprenta</p>
             <p className="mt-1 text-sm leading-snug text-muted">
-              Se aceptan los cambios, se quitan comentarios y se dejan las notas al pie. Calibri, Cambria, Arial, Times, Courier y Tahoma ya están en la app.
+              Se aceptan los cambios, se quitan comentarios y se dejan las notas al pie. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app.
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
@@ -564,7 +564,7 @@ export function Studio() {
               pressed={substitutes}
               onClick={() => void toggleSubstitutes()}
               label="Completar las fuentes"
-              hint="Encendido. Calibri, Cambria, Arial, Times, Courier y Tahoma ya están en la app. El PDF incrusta ese archivo completo, no el recorte del Word."
+              hint="Encendido. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app. El PDF incrusta ese archivo completo, no el recorte del Word."
             />
             <Toggle
               pressed={fullFont}

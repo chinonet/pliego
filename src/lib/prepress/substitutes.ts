@@ -31,6 +31,15 @@ export const SUBSTITUTE_FACES: Array<{
   { family: "Courier New", file: "/fonts/LiberationMono-BoldItalic.ttf", weight: 700, style: "italic" },
   { family: "Tahoma", file: "/fonts/Tahoma.ttf", weight: 400, style: "normal" },
   { family: "Tahoma", file: "/fonts/Tahoma-Bold.ttf", weight: 700, style: "normal" },
+  { family: "Candara", file: "/fonts/Candara-Regular.ttf", weight: 400, style: "normal" },
+  { family: "Candara", file: "/fonts/Candara-Bold.ttf", weight: 700, style: "normal" },
+  { family: "Candara", file: "/fonts/Candara-Italic.ttf", weight: 400, style: "italic" },
+  { family: "Candara", file: "/fonts/Candara-BoldItalic.ttf", weight: 700, style: "italic" },
+  { family: "Candara Light", file: "/fonts/Candara-Light.ttf", weight: 400, style: "normal" },
+  { family: "Candara Light", file: "/fonts/Candara-LightItalic.ttf", weight: 400, style: "italic" },
+  { family: "MS Gothic", file: "/fonts/MSGothic.ttf", weight: 400, style: "normal" },
+  { family: "Symbol", file: "/fonts/Symbol.ttf", weight: 400, style: "normal" },
+  { family: "Wingdings", file: "/fonts/Wingdings.ttf", weight: 400, style: "normal" },
 ];
 
 const STYLE_ID = "pliego-substitutes";

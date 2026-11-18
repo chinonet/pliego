@@ -54,6 +54,11 @@ export const FONT_SUBSTITUTES: Record<string, string> = {
   "courier new": "Liberation Mono",
   courier: "Liberation Mono",
   tahoma: "Tahoma",
+  candara: "Candara",
+  "candara light": "Candara",
+  "ms gothic": "MS Gothic",
+  symbol: "Symbol",
+  wingdings: "Wingdings",
 };
 
 export type FontReport = {
