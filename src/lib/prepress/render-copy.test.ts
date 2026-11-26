@@ -188,4 +188,51 @@ assert.deepEqual(plain.warnings, []);
 const plainBody = await (await JSZip.loadAsync(plain.bytes)).file("word/document.xml")!.async("string");
 assert.equal(plainBody.split(PROBE_MARK).length - 1, 1, "sin pares e impares distintos: una muestra (recibe las notas finales)");
 
+// Las entradas del índice no llevan el azul del estilo «Hyperlink» (como en Word); un enlace web en el texto sí.
+const toc = new JSZip();
+toc.file(
+  "word/styles.xml",
+  `${HEAD}<w:styles ${NS}><w:style w:type="character" w:styleId="Hipervnculo"><w:name w:val="Hyperlink"/><w:rPr><w:color w:val="0000FF"/><w:u w:val="single"/></w:rPr></w:style></w:styles>`,
+);
+toc.file(
+  "word/document.xml",
+  `${HEAD}<w:document ${NS}><w:body>` +
+    `<w:p><w:hyperlink w:anchor="_Toc1" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/><w:noProof/></w:rPr><w:t>CAPÍTULO I</w:t></w:r><w:r><w:t>7</w:t></w:r></w:hyperlink></w:p>` +
+    `<w:p><w:hyperlink w:anchor="_Toc2"><w:r><w:rPr><w:rStyle w:val="Hipervnculo"/></w:rPr><w:t>CAPÍTULO II</w:t></w:r></w:hyperlink></w:p>` +
+    `<w:p><w:hyperlink r:id="rId9"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>www.ejemplo.com</w:t></w:r></w:hyperlink></w:p>` +
+    `<w:p><w:hyperlink w:anchor="nota"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>ver nota</w:t></w:r></w:hyperlink></w:p>` +
+    // La otra forma de Word: un campo HYPERLINK \l "_Toc…" (con el texto partido en varios instrText).
+    `<w:p><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:fldChar w:fldCharType="begin"/></w:r>` +
+    `<w:r><w:instrText xml:space="preserve"> </w:instrText></w:r><w:r><w:instrText>HYPERLINK \\l "_Toc3"</w:instrText></w:r>` +
+    `<w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:fldChar w:fldCharType="separate"/></w:r>` +
+    `<w:r><w:rPr><w:rStyle w:val="Hyperlink"/><w:lang w:val="es-AR"/></w:rPr><w:t>SOBRE ESTA EDICIÓN</w:t></w:r>` +
+    `<w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:fldChar w:fldCharType="end"/></w:r></w:p>` +
+    // Un campo HYPERLINK a una página web sigue como en el Word.
+    `<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> HYPERLINK "https://ejemplo.com" </w:instrText></w:r>` +
+    `<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>ejemplo.com</w:t></w:r>` +
+    `<w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>` +
+    // Dentro del campo TOC (que abarca varios párrafos), aunque el tramo no esté en un enlace.
+    `<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r>` +
+    `<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>PRIMERA</w:t></w:r></w:p>` +
+    `<w:p><w:r><w:rPr><w:rStyle w:val="Hipervnculo"/></w:rPr><w:t>SEGUNDA</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>` +
+    `<w:p><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>después del índice</w:t></w:r></w:p>` +
+    `</w:body></w:document>`,
+);
+const tocBody = await (await JSZip.loadAsync((await prepareRenderCopy(await toc.generateAsync({ type: "uint8array" }))).bytes))
+  .file("word/document.xml")!
+  .async("string");
+const tocParagraphs = tocBody.split("<w:p>").slice(1);
+assert.ok(!tocParagraphs[0]!.includes("rStyle"), tocParagraphs[0]);
+assert.ok(tocParagraphs[0]!.includes("<w:noProof/>"), "lo demás del renglón queda");
+assert.ok(tocParagraphs[0]!.includes('w:anchor="_Toc1"'), "el enlace queda (el PDF igual no lleva enlaces)");
+assert.ok(!tocParagraphs[1]!.includes("rStyle"), "también con el id en otro idioma");
+assert.ok(tocParagraphs[2]!.includes('w:rStyle w:val="Hyperlink"'), "un enlace web sigue como en el Word");
+assert.ok(tocParagraphs[3]!.includes('w:rStyle w:val="Hyperlink"'), "un marcador que no es del índice sigue igual");
+assert.ok(!tocParagraphs[4]!.includes("rStyle"), `campo HYPERLINK \\l "_Toc…": ${tocParagraphs[4]}`);
+assert.ok(tocParagraphs[4]!.includes('<w:lang w:val="es-AR"/>'));
+assert.ok(tocParagraphs[5]!.includes('w:rStyle w:val="Hyperlink"'), "un campo HYPERLINK a una web sigue igual");
+assert.ok(!tocParagraphs[6]!.includes("rStyle"), "dentro del campo TOC");
+assert.ok(!tocParagraphs[7]!.includes("rStyle"), "dentro del campo TOC, en el párrafo siguiente");
+assert.ok(tocParagraphs[8]!.includes('w:rStyle w:val="Hyperlink"'), "después de cerrar el índice, igual que en el Word");
+
 console.log("render-copy ok");

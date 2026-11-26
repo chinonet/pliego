@@ -387,6 +387,73 @@ function fixHyphens(doc: XmlDocument): number {
   return count;
 }
 
+/**
+ * Los estilos de carácter «Hyperlink» del Word (el id cambia según el idioma del Word: se buscan por nombre, que no
+ * cambia). Siempre incluye «Hyperlink», el id que usa Word en inglés y en la mayoría de los documentos.
+ */
+function hyperlinkStyleIds(styles: XmlDocument | null): Set<string> {
+  const ids = new Set(["Hyperlink"]);
+  for (const style of styles ? descendants(styles, "style") : []) {
+    if (attr(style, "type") !== "character") continue;
+    if (attr(children(style, "name")[0], "val").toLowerCase() === "hyperlink") ids.add(attr(style, "styleId"));
+  }
+  return ids;
+}
+
+/** Un campo del índice (TOC) o un enlace de campo a una entrada del índice (HYPERLINK \l "_Toc…"). */
+const TOC_FIELD = /^\s*(?:TOC\b|HYPERLINK\b[\s\S]*\\l\s+"?_Toc)/i;
+
+/**
+ * Las entradas de un índice (o de una tabla de ilustraciones) que arma Word llevan el estilo «Hyperlink», que es azul
+ * y subrayado. Word igual las muestra con la letra del índice, sin azul ni subrayado (así salen en el PDF que hace
+ * Word); el visor les pondría el azul. Word las escribe de dos maneras: un enlace a «_Toc…» (w:hyperlink) o un campo
+ * HYPERLINK \l "_Toc…", y las dos van dentro del campo TOC. Se les quita ese estilo solo ahí: un enlace a una página
+ * web en el texto sigue como en el Word.
+ */
+function plainTocLinks(doc: XmlDocument, hyperlinkIds: Set<string>): number {
+  const plain = new Set<XmlElement>();
+  for (const link of descendants(doc, "hyperlink")) {
+    if (attr(link, "anchor").startsWith("_Toc")) for (const run of descendants(link, "r")) plain.add(run);
+  }
+  for (const field of descendants(doc, "fldSimple")) {
+    if (TOC_FIELD.test(attr(field, "instr"))) for (const run of descendants(field, "r")) plain.add(run);
+  }
+  // Campos complejos (begin … instrText … separate … end), que pueden ocupar varios párrafos y anidarse: cada tramo
+  // se anota con los campos abiertos, y al final (cuando ya se conoce el texto de cada campo) se ve cuáles son del índice.
+  type Field = { instr: string };
+  const open: Field[] = [];
+  const runFields: Array<[XmlElement, Field[]]> = [];
+  for (const run of descendants(doc, "r")) {
+    let inside = [...open];
+    for (const child of children(run)) {
+      const name = localName(child);
+      if (name === "fldChar") {
+        const type = attr(child, "fldCharType");
+        if (type === "begin") {
+          open.push({ instr: "" });
+          inside = [...open];
+        } else if (type === "end") open.pop();
+      } else if (name === "instrText" && open.length) {
+        open[open.length - 1]!.instr += child.textContent ?? "";
+      }
+    }
+    if (inside.length) runFields.push([run, inside]);
+  }
+  for (const [run, fields] of runFields) if (fields.some((field) => TOC_FIELD.test(field.instr))) plain.add(run);
+
+  let count = 0;
+  for (const run of plain) {
+    for (const props of children(run, "rPr")) {
+      for (const style of children(props, "rStyle")) {
+        if (!hyperlinkIds.has(attr(style, "val"))) continue;
+        props.removeChild(style);
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
+
 // ——— Marcas para la paginación: saltos manuales, filas de título y páginas de muestra ———
 
 /** Lo que se ve en un renglón (para saber si un salto de página manual deja algo después en el mismo párrafo). */
@@ -749,6 +816,7 @@ export async function prepareRenderCopy(
     }
   }
 
+  const hyperlinkIds = hyperlinkStyleIds(await readXml(zip, "word/styles.xml"));
   const parts = Object.keys(zip.files).filter((name) => WHERE.some(([pattern]) => pattern.test(name)));
   for (const name of parts) {
     const doc = await readXml(zip, name);
@@ -779,6 +847,7 @@ export async function prepareRenderCopy(
       }
     }
     fixHyphens(doc);
+    plainTocLinks(doc, hyperlinkIds);
     const found = nothingFound();
     convertVml(doc, found);
     findDrawings(doc, found);
