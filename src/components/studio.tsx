@@ -29,7 +29,7 @@ import {
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
 import { fixDefaultStyleSelectors } from "@/lib/prepress/docx-css";
-import { applyLayout, mergeContinuous, numberFootnotes, numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
+import { applyLayout, mergeContinuous, numberFootnotes, numberPages, repaginate, takeMarks, trimPageBottoms } from "@/lib/prepress/paginate";
 import { DEFAULT_RENDER_INFO, prepareRenderCopy, type RenderInfo } from "@/lib/prepress/render-copy";
 import { fixCroppedImages, prepareForExport } from "@/lib/prepress/prepare-export";
 import { auditDocx, auditRenderedImages, type RenderedImage } from "@/lib/prepress/image-audit";
@@ -328,6 +328,7 @@ export function Studio() {
     mergeContinuous(body, map, prepared.info);
     repaginate(body, map, prepared.info);
     const layout = applyLayout(body, map, prepared.info, marked.sections);
+    trimPageBottoms(body);
     numberFootnotes(body, prepared.info, map);
     numberPages(body, marked.sections, map);
     fillLastColumns(body, (article) => {

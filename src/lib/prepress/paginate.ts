@@ -32,8 +32,42 @@ function sheetHeight(page: HTMLElement): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+/** El último bloque con texto de la página. */
+function lastBlockOf(page: HTMLElement): HTMLElement | null {
+  const articles = childrenOf(page, "article").filter((article) => article.children.length > 0);
+  return (articles[articles.length - 1]?.lastElementChild as HTMLElement | null) ?? null;
+}
+
+/**
+ * Lo que Word no cuenta al pie de la página: el espacio después del último párrafo y el interlineado extra debajo de
+ * su último renglón (Word lo pone arriba del texto; el navegador lo reparte arriba y abajo).
+ */
+function bottomSlack(page: HTMLElement): number {
+  const last = lastBlockOf(page);
+  if (!last) return 0;
+  const style = getComputedStyle(last);
+  let slack = Number.parseFloat(style.marginBottom) || 0;
+  if (last.tagName === "P") {
+    const line = Number.parseFloat(style.lineHeight);
+    const size = Number.parseFloat(style.fontSize);
+    if (Number.isFinite(line) && Number.isFinite(size)) slack += Math.max(0, (line - size * 1.17) / 2);
+  }
+  return slack;
+}
+
 function overflows(page: HTMLElement, height: number): boolean {
-  return height > 0 && page.offsetHeight > height + 1;
+  return height > 0 && page.offsetHeight > height + 1 + bottomSlack(page);
+}
+
+/**
+ * Como Word, el último párrafo de cada página no lleva espacio después (así la hoja no crece por ese margen). Va al
+ * final, cuando las páginas ya no cambian.
+ */
+export function trimPageBottoms(root: HTMLElement) {
+  for (const page of pagesOf(root)) {
+    const last = lastBlockOf(page);
+    if (last && (Number.parseFloat(getComputedStyle(last).marginBottom) || 0) > 0) last.style.marginBottom = "0px";
+  }
 }
 
 function markTexts(root: HTMLElement): Text[] {
@@ -374,7 +408,8 @@ function surelyOut(page: HTMLElement, height: number): HTMLElement[] {
   const totalRefs = items.length;
   const bottom = (index: number): number => {
     const block = blocks[index]!;
-    return block.getBoundingClientRect().bottom + (Number.parseFloat(getComputedStyle(block).marginBottom) || 0) * k;
+    // Sin el espacio después: si este bloque queda último, Word no lo cuenta.
+    return block.getBoundingClientRect().bottom;
   };
   const keep = lastFitting(blocks.length, bottom, refs, totalRefs, limit, relief);
   return blocks.slice(keep + 2);
