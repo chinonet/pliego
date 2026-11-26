@@ -53,6 +53,35 @@
   box-shadow: none !important;
 }
 
+/*
+ * Mientras se arma el PDF, los números y viñetas de lista, las mayúsculas de estilo y las versalitas pasan a texto de
+ * verdad (lo único que el PDF copia). Estas reglas apagan lo que el navegador dibujaba en su lugar. El ::before queda
+ * vacío pero no se quita, para que los contadores de la numeración sigan contando igual.
+ */
+.pliego-exporting .pliego-x-sin-antes::before {
+  content: "" !important;
+  display: inline !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: none !important;
+  width: auto !important;
+  min-width: 0 !important;
+}
+
+.pliego-exporting .pliego-x-sin-vineta {
+  list-style-type: none !important;
+  list-style-image: none !important;
+}
+
+.pliego-exporting .pliego-x-sin-transformar {
+  text-transform: none !important;
+}
+
+.pliego-exporting .pliego-x-sin-versalitas {
+  font-variant-caps: normal !important;
+}
+
 @media print {
   body {
     background: white !important;
