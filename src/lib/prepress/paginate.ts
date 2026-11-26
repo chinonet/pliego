@@ -1,4 +1,4 @@
-import { MARK_CLOSE, MARK_OPEN, PAGE_MARK, PAGES_MARK, type SectionNumbering } from "./fields";
+import { MARK_CLOSE, MARK_OPEN, PAGE_MARK, PAGES_MARK, type SectionNumbering } from "./fields.ts";
 
 const PAGE_SELECTOR = "section.docx";
 
