@@ -610,6 +610,8 @@ export type RenderedImage = {
   ppi: number;
   level: ImageLevel;
   note: string;
+  /** Si la misma imagen se repite (encabezado o pie): todas las páginas donde está; `page` es la primera. */
+  pages?: number[];
 };
 
 function isBitonal(bytes: Uint8Array): boolean {
@@ -636,6 +638,50 @@ function naturalSize(url: string): Promise<{ width: number; height: number }> {
   });
 }
 
+/** Lo mismo por dirección, una sola vez: el logo del encabezado está en todas las páginas y es el mismo archivo. */
+function cached<T>(load: (url: string) => Promise<T>): (url: string) => Promise<T> {
+  const done = new Map<string, Promise<T>>();
+  return (url) => {
+    let found = done.get(url);
+    if (!found) {
+      found = load(url);
+      done.set(url, found);
+    }
+    return found;
+  };
+}
+
+/** «3», «3 y 8», «3, 5 y 8» o «de la 3 a la 300 (298 páginas)» cuando son muchas. */
+export function pagesLabel(pages: number[]): string {
+  const list = [...new Set(pages)].sort((a, b) => a - b);
+  if (list.length <= 4) return list.length > 1 ? `${list.slice(0, -1).join(", ")} y ${list[list.length - 1]}` : `${list[0] ?? ""}`;
+  return `de la ${list[0]} a la ${list[list.length - 1]} (${list.length} páginas)`;
+}
+
+/**
+ * La misma imagen, con la misma medida, repetida en varias páginas (un logo o un filete del encabezado o del pie,
+ * que se copia en cada página) queda como una sola entrada: la de la primera página, con la lista de las demás.
+ */
+export function mergeRepeated(items: Array<{ key: string; image: RenderedImage }>): RenderedImage[] {
+  const groups = new Map<string, { image: RenderedImage; pages: number[] }>();
+  const out: Array<{ image: RenderedImage; pages: number[] }> = [];
+  for (const { key, image } of items) {
+    const group = key ? groups.get(key) : undefined;
+    if (group) {
+      group.pages.push(image.page);
+      continue;
+    }
+    const fresh = { image, pages: [image.page] };
+    if (key) groups.set(key, fresh);
+    out.push(fresh);
+  }
+  return out.map(({ image, pages }) => {
+    const unique = [...new Set(pages)];
+    if (unique.length < 2) return image;
+    return { ...image, pages: unique, note: `${image.note} · se repite en las páginas ${pagesLabel(unique)}` };
+  });
+}
+
 /** Mide cada imagen ya compuesta (solo lee el DOM; usar con la página a escala 1 o con medidas de maqueta). */
 export async function auditRenderedImages(root: ParentNode): Promise<RenderedImage[]> {
   const sections = [...root.querySelectorAll("section.docx")];
@@ -643,16 +689,31 @@ export async function auditRenderedImages(root: ParentNode): Promise<RenderedIma
     const section = node.closest("section.docx");
     return section ? sections.indexOf(section) + 1 : 0;
   };
-  const results: RenderedImage[] = [];
+  const results: Array<{ key: string; image: RenderedImage }> = [];
+  const bytesOf = cached(sourceBytes);
+  const sizeOf = cached(naturalSize);
   const images = [...root.querySelectorAll("section.docx img")] as HTMLImageElement[];
+  // La misma imagen con la misma medida y el mismo recorte en otra página: ya está medida, solo suma la página.
+  const measured = new Map<string, Omit<RenderedImage, "page">>();
   for (const [index, img] of images.entries()) {
-    const label = img.alt || `Imagen ${index + 1}`;
     const page = pageOf(img);
-    if (!img.naturalWidth || !img.naturalHeight) {
-      results.push({ label, page, pixels: "—", ppi: 0, level: "rota", note: "no se pudo mostrar: no va a salir" });
+    const url = img.currentSrc || img.src;
+    const key = url
+      ? [url, img.alt, img.clientWidth, img.clientHeight, img.style.transform, img.naturalWidth, img.naturalHeight].join("|")
+      : "";
+    const known = key ? measured.get(key) : undefined;
+    if (known) {
+      results.push({ key, image: { ...known, page } });
       continue;
     }
-    const bytes = await sourceBytes(img.currentSrc || img.src);
+    const label = img.alt || `Imagen ${index + 1}`;
+    if (!img.naturalWidth || !img.naturalHeight) {
+      const broken = { label, pixels: "—", ppi: 0, level: "rota" as const, note: "no se pudo mostrar: no va a salir" };
+      if (key) measured.set(key, broken);
+      results.push({ key, image: { ...broken, page } });
+      continue;
+    }
+    const bytes = await bytesOf(url);
     const format = bytes ? sniffImage(bytes) : "desconocido";
     const crop = cropFromTransform(img.style.transform || "");
     const result = imageLevels({
@@ -668,39 +729,46 @@ export async function auditRenderedImages(root: ParentNode): Promise<RenderedIma
     if ((crop.l ?? 0) > 0 || (crop.t ?? 0) > 0) notes.push("recortada: revisá el recorte en el PDF");
     if (/rotate\(/.test(img.style.transform || "")) notes.push("girada: revisala en el PDF");
     const cropped = result.visibleWidth !== img.naturalWidth || result.visibleHeight !== img.naturalHeight;
-    results.push({
+    const entry = {
       label,
-      page,
       pixels: cropped
         ? `${result.visibleWidth}×${result.visibleHeight} de ${img.naturalWidth}×${img.naturalHeight}`
         : `${img.naturalWidth}×${img.naturalHeight}`,
       ppi: result.ppi,
       level: result.level,
       note: notes.join(" · "),
-    });
+    };
+    if (key) measured.set(key, entry);
+    results.push({ key, image: { ...entry, page } });
   }
   // Imágenes del formato viejo de Word (VML): el visor las pone dentro de un <svg>.
   const legacy = [...root.querySelectorAll("section.docx svg image")] as SVGImageElement[];
+  const legacyMeasured = new Map<string, Omit<RenderedImage, "page">>();
   for (const [index, image] of legacy.entries()) {
     const url = image.getAttribute("href") || image.getAttribute("xlink:href") || "";
-    const label = `Imagen antigua ${index + 1}`;
     const page = pageOf(image);
-    const size = url ? await naturalSize(url) : { width: 0, height: 0 };
     let box = { width: 0, height: 0 };
     try {
       box = image.getBBox();
     } catch {
       /* Sin caja: queda sin medida. */
     }
+    const key = url ? ["vml", url, box.width, box.height].join("|") : "";
+    const known = key ? legacyMeasured.get(key) : undefined;
+    if (known) {
+      results.push({ key, image: { ...known, page } });
+      continue;
+    }
+    const label = `Imagen antigua ${index + 1}`;
+    const size = url ? await sizeOf(url) : { width: 0, height: 0 };
     const result = imageLevels({
       naturalWidth: size.width,
       naturalHeight: size.height,
       widthIn: box.width / 96,
       heightIn: box.height / 96,
     });
-    results.push({
+    const entry = {
       label,
-      page,
       pixels: size.width ? `${size.width}×${size.height}` : "—",
       ppi: result.ppi,
       level: result.level,
@@ -708,7 +776,9 @@ export async function auditRenderedImages(root: ParentNode): Promise<RenderedIma
         result.level === "rota"
           ? result.note
           : `${result.note} · formato viejo de Word: puede no salir en el PDF; volvé a insertarla`,
-    });
+    };
+    if (key) legacyMeasured.set(key, entry);
+    results.push({ key, image: { ...entry, page } });
   }
-  return results;
+  return mergeRepeated(results);
 }

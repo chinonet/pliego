@@ -63,13 +63,37 @@ export function faceKey(family: string, weight: number, style: string): string {
 
 const STYLE_ID = "pliego-substitutes";
 
-/** Caras sustitutas que se publican; `skip` son claves de faceKey (por ejemplo, las que el Word trae incrustadas). */
+/**
+ * Nombre aparte con el que se publica también la sustituta de una cara que el Word trae recortada (solo las letras
+ * que usa): puesto en segundo lugar en la lista de fuentes, completa lo que a esa cara le falta.
+ */
+export function substituteAlias(family: string): string {
+  return `${family} (sustituta)`;
+}
+
+type SubstituteFace = (typeof SUBSTITUTE_FACES)[number];
+
+/** Caras sustitutas que se publican; `skip` son claves de faceKey (por ejemplo, las que el Word trae enteras). */
 function activeFaces(skip?: Iterable<string>) {
   const skipped = new Set(skip ?? []);
   return SUBSTITUTE_FACES.filter((face) => !skipped.has(faceKey(face.family, face.weight, face.style)));
 }
 
-export function installSubstitutes(enabled: boolean, skip?: Iterable<string>) {
+/** Las sustitutas que, además, van con su nombre aparte (`fallback`: claves faceKey de caras recortadas del Word). */
+function aliasFaces(fallback?: Iterable<string>): SubstituteFace[] {
+  const wanted = new Set(fallback ?? []);
+  return wanted.size ? SUBSTITUTE_FACES.filter((face) => wanted.has(faceKey(face.family, face.weight, face.style))) : [];
+}
+
+function faceRule(family: string, face: SubstituteFace): string {
+  return `@font-face{font-family:"${family}";src:url("${face.file}") format("truetype");font-weight:${face.weight};font-style:${face.style};font-display:swap;}`;
+}
+
+/**
+ * Publica las sustitutas. `skip`: caras que no van (las que el Word trae enteras). `fallback`: caras que el Word trae
+ * recortadas; su sustituta va también con el nombre de substituteAlias, para completar las letras que falten.
+ */
+export function installSubstitutes(enabled: boolean, skip?: Iterable<string>, fallback?: Iterable<string>) {
   const existing = document.getElementById(STYLE_ID);
   if (!enabled) {
     existing?.remove();
@@ -77,23 +101,75 @@ export function installSubstitutes(enabled: boolean, skip?: Iterable<string>) {
   }
   const style = existing ?? document.createElement("style");
   style.id = STYLE_ID;
-  style.textContent = activeFaces(skip)
-    .map(
-      (face) =>
-        `@font-face{font-family:"${face.family}";src:url("${face.file}") format("truetype");font-weight:${face.weight};font-style:${face.style};font-display:swap;}`,
-    )
-    .join("\n");
+  style.textContent = [
+    ...activeFaces(skip).map((face) => faceRule(face.family, face)),
+    ...aliasFaces(fallback).map((face) => faceRule(substituteAlias(face.family), face)),
+  ].join("\n");
   document.head.appendChild(style);
 }
 
-export async function loadSubstituteFaces(skip?: Iterable<string>) {
+export async function loadSubstituteFaces(skip?: Iterable<string>, fallback?: Iterable<string>) {
   if (!("fonts" in document)) return;
+  const faces = [
+    ...activeFaces(skip).map((face) => ({ family: face.family, face })),
+    ...aliasFaces(fallback).map((face) => ({ family: substituteAlias(face.family), face })),
+  ];
   await Promise.all(
-    activeFaces(skip).map((face) =>
-      document.fonts.load(`${face.style} ${face.weight} 16px "${face.family}"`).catch(() => undefined),
+    faces.map(({ family, face }) =>
+      document.fonts.load(`${face.style} ${face.weight} 16px "${family}"`).catch(() => undefined),
     ),
   );
   await document.fonts.ready;
+}
+
+/**
+ * La lista de fuentes con la sustituta en segundo lugar, detrás de la primera («"Calibri", serif» →
+ * «"Calibri", "Calibri (sustituta)", serif»). Si ya está, queda igual.
+ */
+export function withSubstituteAlias(fontFamily: string, alias: string): string {
+  const parts = fontFamily.split(",").map((part) => part.trim()).filter(Boolean);
+  const bare = (part: string) => part.replace(/^['"]+|['"]+$/g, "").toLowerCase();
+  if (parts.some((part) => bare(part) === alias.toLowerCase())) return fontFamily;
+  const quoted = `"${alias.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  return [...parts.slice(0, 1), quoted, ...parts.slice(1)].join(", ");
+}
+
+/**
+ * Pone la sustituta detrás de cada texto escrito con una cara recortada del Word (`fallback`, claves faceKey), para
+ * que la pantalla y el PDF saquen de ahí las letras que esa cara no trae (números de página, «‑», versalitas…) en vez
+ * de una fuente del sistema. Solo toca el estilo del visor, nunca el Word. Devuelve con qué deshacerlo.
+ */
+export function addSubstituteFallback(root: ParentNode, fallback: Iterable<string>): () => void {
+  const wanted = new Map<string, string>();
+  for (const face of aliasFaces(fallback)) {
+    wanted.set(faceKey(face.family, face.weight, face.style), substituteAlias(face.family));
+  }
+  const undo: Array<() => void> = [];
+  if (!wanted.size) return () => undefined;
+  const seen = new Set<Element>();
+  const walker = document.createTreeWalker(root as Node, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const parent = node.parentElement;
+    if (!parent || seen.has(parent) || !(node.nodeValue ?? "").trim() || parent.closest("style, script")) continue;
+    seen.add(parent);
+    const css = getComputedStyle(parent);
+    const family = firstFamily(css.fontFamily);
+    const alias = wanted.get(faceKey(family, Number.parseInt(css.fontWeight, 10) || 400, css.fontStyle === "normal" ? "normal" : "italic"));
+    if (!alias) continue;
+    const next = withSubstituteAlias(css.fontFamily, alias);
+    if (next === css.fontFamily) continue;
+    const element = parent as HTMLElement;
+    const before = element.style.getPropertyValue("font-family");
+    const priority = element.style.getPropertyPriority("font-family");
+    element.style.setProperty("font-family", next, priority);
+    undo.push(() => {
+      if (before) element.style.setProperty("font-family", before, priority);
+      else element.style.removeProperty("font-family");
+    });
+  }
+  return () => {
+    for (const step of undo.reverse()) step();
+  };
 }
 
 /* ---------- Caras que faltan ---------- */
@@ -388,7 +464,26 @@ export async function embeddedFonts(bytes: Uint8Array): Promise<{ faces: Embedde
   return { faces, warnings };
 }
 
-/** Claves faceKey de las caras incrustadas: pasarlas como `skip` para que la sustituta no tape a la del Word. */
-export function embeddedSkips(faces: Array<{ family: string; weight: number; style: string }>): Set<string> {
-  return new Set(faces.map((face) => faceKey(face.family, face.weight, face.style)));
+/**
+ * Claves faceKey de las caras incrustadas enteras: pasarlas como `skip` para que la sustituta no tape a la del Word.
+ * Una cara recortada (`subsetted`: solo las letras que usa el texto) no se salta: la sustituta queda detrás para las
+ * letras que agrega Pliego (números de página, «‑», mayúsculas de las versalitas). Ver subsetFallbacks.
+ */
+export function embeddedSkips(
+  faces: Array<{ family: string; weight: number; style: string; subsetted?: boolean }>,
+): Set<string> {
+  return new Set(faces.filter((face) => !face.subsetted).map((face) => faceKey(face.family, face.weight, face.style)));
+}
+
+/** Claves faceKey de las caras recortadas del Word que tienen sustituta: para installSubstitutes y addSubstituteFallback. */
+export function subsetFallbacks(
+  faces: Array<{ family: string; weight: number; style: string; subsetted?: boolean }>,
+): Set<string> {
+  const known = new Set(SUBSTITUTE_FACES.map((face) => faceKey(face.family, face.weight, face.style)));
+  return new Set(
+    faces
+      .filter((face) => face.subsetted)
+      .map((face) => faceKey(face.family, face.weight, face.style))
+      .filter((key) => known.has(key)),
+  );
 }

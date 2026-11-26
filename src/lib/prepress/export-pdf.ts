@@ -19,6 +19,8 @@ export type PdfExport = {
    * `subset: true` se arregla sola. Con `subset: true` ya pedido queda en false (el aviso sigue en `problems`).
    */
   needsSubset: boolean;
+  /** Lo que se cambió para la imprenta y conviene saber (no impide PDF/X). */
+  notes: string[];
 };
 
 export type ExportOptions = {
@@ -28,7 +30,10 @@ export type ExportOptions = {
   grayscale?: boolean;
   /** Sangrado de 0,125" (9 pt) arriba, abajo y en el borde de afuera (nunca en el lomo). */
   bleed?: boolean;
-  /** Para PDF/X: las imágenes con transparencia (PNG sin pérdida) se componen sobre blanco, sin recomprimir. */
+  /**
+   * Para PDF/X: las imágenes con transparencia (PNG sin pérdida) se componen sobre blanco, sin recomprimir. Solo las
+   * que no tienen nada pintado debajo (un fondo de color, texto u otra imagen): esas se ven igual sobre el papel.
+   */
   flatten?: boolean;
 };
 
@@ -57,6 +62,8 @@ export async function exportPagesToPdf(
   merged.setProducer("Pliego premedia");
 
   let pageIndex = 0;
+  // Las imágenes (por su objeto en el PDF final) que tienen algo pintado debajo: esas no se ponen sobre blanco.
+  const overPaint = new Set<string>();
   for (const section of sections) {
     // Lo mismo que toPdf, pero con el paso intermedio a mano para recortar las imágenes recortadas en el Word
     // (jsafa no aplica el clip-path del visor y las sacaría enteras).
@@ -64,9 +71,12 @@ export async function exportPagesToPdf(
     await jsafa.registerFontsFromCss(section.ownerDocument);
     const captured = jsafa.captureElement(section);
     clipCroppedImages(captured);
+    const covered = imagesOverPaint(captured.ops as unknown as ReadonlyArray<PaintOp>);
     const bytes = await jsafa.emitPdf(captured, { subset: opts.subset, title: opts.title });
     const part = await PDFDocument.load(bytes);
     const copied = await merged.copyPages(part, part.getPageIndices());
+    // Una sección es una página; si saliera más de una, no se sabe qué imagen es cuál y ninguna se aplana.
+    for (const page of copied) markOverPaint(lib, page, copied.length === 1 ? covered : null, overPaint);
     for (const page of copied) {
       const { width, height } = page.getSize();
       // El corte es la página del Word; el sangrado y las marcas quedan alrededor, sin mover el contenido.
@@ -85,7 +95,7 @@ export async function exportPagesToPdf(
     }
   }
 
-  const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset);
+  const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset, overPaint);
   const problems = found.problems;
   shareFontPrograms(lib, merged);
   const pdfx = problems.length === 0;
@@ -97,10 +107,148 @@ export async function exportPagesToPdf(
   const bytes = await merged.save({ useObjectStreams: false });
   // pdf-lib siempre escribe «%PDF-1.7»; PDF/X-1a:2001 pide 1.3. Mismo largo: no se corre ningún desplazamiento.
   setHeaderVersion(bytes, pdfx ? "1.3" : "1.4");
-  return { bytes, pdfx, problems, needsSubset: found.wholeOtf && !opts.subset };
+  return { bytes, pdfx, problems, needsSubset: found.wholeOtf && !opts.subset, notes: found.notes };
 }
 
 export type Box = { x: number; y: number; width: number; height: number };
+
+type Rgba = { r: number; g: number; b: number; a: number };
+type Side = { width: number; color: Rgba };
+/** Lo que hace falta de cada operación de captureElement() (jsafa) para saber qué queda pintado y dónde, en px. */
+export type PaintOp = {
+  kind: string;
+  /** Matriz [a b c d e f] que lleva las coordenadas de la operación a las de la página (px a px). */
+  transform?: readonly number[] | null;
+  box?: { rect: Box; background?: Rgba | null; top?: Side; right?: Side; bottom?: Side; left?: Side };
+  image?: { draw: Box };
+  run?: { rect: Box; style?: { color?: Rgba } };
+};
+
+/** Medio píxel de tolerancia: lo que apenas se toca en el borde no cuenta como «debajo». */
+const TOUCH = 0.5;
+
+function boundsOf(rect: Box, matrix: readonly number[] | null | undefined): Box {
+  if (!matrix || matrix.length < 6) return rect;
+  const [a = 1, b = 0, c = 0, d = 1, e = 0, f = 0] = matrix;
+  const corners: Array<[number, number]> = [
+    [rect.x, rect.y],
+    [rect.x + rect.width, rect.y],
+    [rect.x + rect.width, rect.y + rect.height],
+    [rect.x, rect.y + rect.height],
+  ];
+  const xs = corners.map(([x, y]) => a * x + c * y + e);
+  const ys = corners.map(([x, y]) => b * x + d * y + f);
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
+}
+
+function overlaps(a: Box, b: Box): boolean {
+  return (
+    a.x < b.x + b.width - TOUCH &&
+    b.x < a.x + a.width - TOUCH &&
+    a.y < b.y + b.height - TOUCH &&
+    b.y < a.y + a.height - TOUCH
+  );
+}
+
+/** Blanco (o nada): sobre el papel no se distingue de la hoja. */
+function isWhite(color: Rgba): boolean {
+  return color.a <= 0 || (color.r >= 0.998 && color.g >= 0.998 && color.b >= 0.998);
+}
+
+function visibleSide(side: Side | undefined): side is Side {
+  return Boolean(side && side.width > 0 && !isWhite(side.color));
+}
+
+/** Las zonas que pinta una operación: fondo de color, bordes, texto o imagen. Un enlace no pinta nada. */
+function paintedAreas(op: PaintOp): Box[] {
+  if (op.kind === "box" && op.box) {
+    const { rect, background, top, right, bottom, left } = op.box;
+    const out: Box[] = [];
+    if (background && !isWhite(background)) out.push(rect);
+    if (visibleSide(top)) out.push({ x: rect.x, y: rect.y, width: rect.width, height: top.width });
+    if (visibleSide(bottom)) {
+      out.push({ x: rect.x, y: rect.y + rect.height - bottom.width, width: rect.width, height: bottom.width });
+    }
+    if (visibleSide(left)) out.push({ x: rect.x, y: rect.y, width: left.width, height: rect.height });
+    if (visibleSide(right)) {
+      out.push({ x: rect.x + rect.width - right.width, y: rect.y, width: right.width, height: rect.height });
+    }
+    return out;
+  }
+  if (op.kind === "image" && op.image) return [op.image.draw];
+  if (op.kind === "text" && op.run) {
+    const color = op.run.style?.color;
+    return color && color.a <= 0 ? [] : [op.run.rect];
+  }
+  return [];
+}
+
+/**
+ * Para cada imagen de la página (en el orden en que se dibujan), si debajo ya hay algo pintado: un fondo de color,
+ * un borde, texto u otra imagen. Ponerla sobre blanco taparía eso con un rectángulo blanco que el Word no tiene.
+ */
+export function imagesOverPaint(ops: ReadonlyArray<PaintOp>): boolean[] {
+  const painted: Box[] = [];
+  const out: boolean[] = [];
+  for (const op of ops) {
+    if (op.kind === "image" && op.image) {
+      const area = boundsOf(op.image.draw, op.transform);
+      out.push(painted.some((rect) => overlaps(rect, area)));
+    }
+    for (const rect of paintedAreas(op)) painted.push(boundsOf(rect, op.transform));
+  }
+  return out;
+}
+
+/** Los nombres de los XObject que dibuja un contenido («/Im1 Do»), en orden. */
+export function drawnNames(content: string): string[] {
+  const names: string[] = [];
+  for (const match of content.matchAll(/\/([^\s/[\]()<>{}%]+)\s+Do(?=[\s/[\]()<>{}%]|$)/g)) {
+    names.push(match[1]!.replace(/#([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))));
+  }
+  return names;
+}
+
+function streamText(lib: PdfLib, context: PDFContextType, ref: PDFRefType): string {
+  const stream = context.lookup(ref);
+  if (stream instanceof lib.PDFContentStream) return stream.getContentsString();
+  if (!(stream instanceof lib.PDFRawStream)) return "";
+  const raw = lib.decodePDFRawStream(stream).decode();
+  let text = "";
+  for (let i = 0; i < raw.length; i += 0x8000) text += String.fromCharCode(...raw.subarray(i, i + 0x8000));
+  return text;
+}
+
+/**
+ * jsafa dibuja cada imagen capturada con un «Do», en el mismo orden: así cada imagen del PDF se cruza con lo que se
+ * capturó. Las que tienen algo debajo se anotan en `out`. Si no cuadra la cuenta (o `covered` es null), se anotan
+ * todas las de la página: mejor dejar la transparencia y avisar que tapar algo.
+ */
+function markOverPaint(lib: PdfLib, page: PDFPageType, covered: boolean[] | null, out: Set<string>) {
+  const context = page.doc.context;
+  const objects = asDict(lib, context, page.node.Resources()?.get(lib.PDFName.of("XObject")));
+  if (!objects) return;
+  const drawn: PDFRefType[] = [];
+  const text = contentRefs(lib, page).map((ref) => streamText(lib, context, ref)).join("\n");
+  for (const name of drawnNames(text)) {
+    const ref = objects.get(lib.PDFName.of(name));
+    if (!(ref instanceof lib.PDFRef)) continue;
+    const stream = context.lookup(ref);
+    if (stream instanceof lib.PDFRawStream && nameOf(lib, context, stream.dict.get(lib.PDFName.of("Subtype"))) === "Image") {
+      drawn.push(ref);
+    }
+  }
+  if (!covered || covered.length !== drawn.length) {
+    for (const [, value] of objects.entries()) if (value instanceof lib.PDFRef) out.add(value.toString());
+    return;
+  }
+  drawn.forEach((ref, index) => {
+    if (covered[index]) out.add(ref.toString());
+  });
+}
+
 export type MarkLine = [[number, number], [number, number]];
 
 /** 0,125" en puntos: el sangrado que pide Lightning Source. */
@@ -235,17 +383,21 @@ function contentRefs(lib: PdfLib, page: PDFPageType): PDFRefType[] {
   return contents instanceof lib.PDFRef ? [contents] : [];
 }
 
-/** Imagen RGB sin pérdida (Flate, 8 bits, sin predictor) → gris, también sin pérdida. Una transparencia se compone sobre blanco. */
-function imageToGray(lib: PdfLib, context: PDFContextType, ref: PDFRefType): boolean {
+/**
+ * Imagen RGB sin pérdida (Flate, 8 bits, sin predictor) → gris, también sin pérdida. Con `onWhite` la transparencia se
+ * compone sobre blanco; si no (hay algo pintado debajo), la imagen pasa a gris y conserva su transparencia.
+ */
+function imageToGray(lib: PdfLib, context: PDFContextType, ref: PDFRefType, onWhite: boolean): boolean {
   const image = readFlateImage(lib, context, ref);
   const stream = context.lookup(ref);
   if (!image || image.channels !== 3 || !(stream instanceof lib.PDFRawStream)) return false;
   let gray = rgbToGray(image.pixels);
-  if (image.alpha) gray = compositeOnWhite(gray, image.alpha, 1);
+  const flat = Boolean(image.alpha) && onWhite;
+  if (image.alpha && onWhite) gray = compositeOnWhite(gray, image.alpha, 1);
   const dict = stream.dict;
   dict.set(lib.PDFName.of("ColorSpace"), lib.PDFName.of("DeviceGray"));
-  replaceStream(lib, context, ref, dict, gray, ["SMask", "Decode"]);
-  dropMask(context, image);
+  replaceStream(lib, context, ref, dict, gray, flat ? ["SMask", "Decode"] : ["Decode"]);
+  if (flat) dropMask(context, image);
   return true;
 }
 
@@ -356,7 +508,8 @@ function wholeOpenTypeCff(lib: PdfLib, context: PDFContextType, font: PDFDictTyp
   const descriptor = asDict(lib, context, target.get(lib.PDFName.of("FontDescriptor")));
   const file = descriptor ? lookup(lib, context, descriptor.get(lib.PDFName.of("FontFile3"))) : undefined;
   if (!(file instanceof lib.PDFRawStream)) return false;
-  const head = lib.decodePDFRawStream(file).decode().subarray(0, 4);
+  // Solo los primeros 4 bytes: descomprimir el programa entero, página por página, es mucho trabajo para nada.
+  const head = lib.decodePDFRawStream(file).getBytes(4);
   return String.fromCharCode(...head) === "OTTO";
 }
 
@@ -370,13 +523,16 @@ function prepareForPress(
   grayscale: boolean,
   flatten: boolean,
   subset: boolean,
-): { problems: string[]; wholeOtf: boolean } {
+  overPaint: ReadonlySet<string> = new Set(),
+): { problems: string[]; wholeOtf: boolean; notes: string[] } {
   const context = doc.context;
   const missingFonts = new Set<string>();
   const wholeOtf = new Set<string>();
   const colorImages = new Set<number>();
   const deepImages = new Set<number>();
   const maskedImages = new Set<number>();
+  const coveredImages = new Set<number>();
+  const flattenedImages = new Set<number>();
   let colorVectors = false;
   let opacity = false;
   let transparency = false;
@@ -416,8 +572,11 @@ function prepareForPress(
       if (subtype === "Image") {
         if (seenImages.has(key)) continue;
         seenImages.add(key);
-        if (grayscale) imageToGray(lib, context, value);
-        if (flatten) flattenImage(lib, context, value);
+        const hadMask = Boolean(stream.dict.get(lib.PDFName.of("SMask")));
+        // Sobre blanco solo si no hay nada pintado debajo: si no, quedaría un rectángulo blanco tapando el fondo.
+        const clear = !overPaint.has(key);
+        if (grayscale) imageToGray(lib, context, value, clear);
+        if (flatten && clear) flattenImage(lib, context, value);
         const image = context.lookup(value);
         if (!(image instanceof lib.PDFRawStream)) continue;
         const space = nameOf(lib, context, image.dict.get(lib.PDFName.of("ColorSpace")));
@@ -425,7 +584,10 @@ function prepareForPress(
         // Hoy jsafa escribe siempre 8 bits (los PNG pasan por RGBA de 8 bits); se revisa por si eso cambia.
         const bits = numberOf(lib, context, image.dict.get(lib.PDFName.of("BitsPerComponent")));
         if (bits !== undefined && bits > 8) deepImages.add(pageNumber);
-        if (image.dict.get(lib.PDFName.of("SMask"))) maskedImages.add(pageNumber);
+        if (image.dict.get(lib.PDFName.of("SMask"))) {
+          if (!clear && (flatten || grayscale)) coveredImages.add(pageNumber);
+          else maskedImages.add(pageNumber);
+        } else if (hadMask) flattenedImages.add(pageNumber);
       } else if (subtype === "Form" && !seenStreams.has(key)) {
         seenStreams.add(key);
         if (stream.dict.get(lib.PDFName.of("Group"))) transparency = true;
@@ -437,7 +599,7 @@ function prepareForPress(
   };
 
   doc.getPages().forEach((page, index) => {
-    page.node.delete(lib.PDFName.of("Annots"));
+    dropAnnotations(lib, context, page);
     if (page.node.get(lib.PDFName.of("Group"))) transparency = true;
     for (const ref of contentRefs(lib, page)) {
       const key = ref.toString();
@@ -483,11 +645,42 @@ function prepareForPress(
         : `Hay imágenes con transparencia, por ejemplo un PNG con fondo transparente (páginas ${pageList(maskedImages)}), que PDF/X-1a no admite.`,
     );
   }
+  if (coveredImages.size) {
+    problems.push(
+      `Hay imágenes con fondo transparente encima de un color, un texto u otra imagen (páginas ${pageList(coveredImages)}). No se pusieron sobre blanco para no tapar lo de abajo, pero PDF/X-1a no admite esa transparencia: en el Word, usá una versión de la imagen con el fondo ya pintado.`,
+    );
+  }
   if (opacity) {
     problems.push("Hay texto, filetes o imágenes semitransparentes (con opacidad), que PDF/X-1a no admite. Dejalos opacos en el Word.");
   }
   if (transparency) problems.push("Hay transparencias (máscaras o grupos transparentes), que PDF/X-1a no admite.");
-  return { problems, wholeOtf: wholeOtf.size > 0 };
+  const notes: string[] = [];
+  if (flattenedImages.size) {
+    notes.push(
+      `Las imágenes con fondo transparente (páginas ${pageList(flattenedImages)}) se pusieron sobre blanco, como pide PDF/X: no tenían nada debajo, así que en papel se ven igual.`,
+    );
+  }
+  return { problems, wholeOtf: wholeOtf.size > 0, notes };
+}
+
+/**
+ * Saca las anotaciones de la página (los enlaces web: la imprenta no los quiere) y también sus objetos, con la acción
+ * de cada enlace: si solo se borrara la lista, quedarían sueltos dentro del archivo.
+ */
+function dropAnnotations(lib: PdfLib, context: PDFContextType, page: PDFPageType) {
+  const key = lib.PDFName.of("Annots");
+  const value = page.node.get(key);
+  const list = lookup(lib, context, value);
+  if (list instanceof lib.PDFArray) {
+    for (const item of list.asArray()) {
+      const annot = asDict(lib, context, item);
+      const action = annot?.get(lib.PDFName.of("A"));
+      if (action instanceof lib.PDFRef) context.delete(action);
+      if (item instanceof lib.PDFRef) context.delete(item);
+    }
+  }
+  if (value instanceof lib.PDFRef) context.delete(value);
+  page.node.delete(key);
 }
 
 /** Las primeras 12 páginas de la lista, para el aviso. */
