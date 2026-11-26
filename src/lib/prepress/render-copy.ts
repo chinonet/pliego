@@ -79,6 +79,27 @@ export const HEADER_ROW_MARK = `${MARK_OPEN}H${MARK_CLOSE}`;
  * que el visor dibuje el encabezado y el pie comunes y de página par de la sección. Se sacan antes de paginar.
  */
 export const PROBE_MARK = `${MARK_OPEN}Q${MARK_CLOSE}`;
+/**
+ * Al final de un párrafo vacío, en un tramo con la letra de su marca de párrafo (w:pPr/w:rPr): en Word un párrafo sin
+ * texto tiene el alto de esa letra, no la del estilo. Se lee y se saca apenas se dibuja (tab-stops.ts).
+ */
+export const EMPTY_PARAGRAPH_MARK = `${MARK_OPEN}E${MARK_CLOSE}`;
+/**
+ * Al principio de un párrafo con tabulaciones alineadas a la derecha, al centro o decimales: sus tabulaciones, en
+ * puntos desde el borde de la columna («T» + «pos:alineación:relleno;…»). Se lee y se saca apenas se dibuja.
+ */
+export const TABS_MARK_OPEN = `${MARK_OPEN}T`;
+/**
+ * Un párrafo de muestra al final del documento, copia del separador de notas al pie del Word (footnotes.xml): Word le
+ * reserva su alto entre el texto y las notas de cada página, y dibuja ahí la raya. Se mide después del interlineado y se
+ * saca antes de paginar.
+ */
+export const NOTE_SEPARATOR_MARK = `${MARK_OPEN}Z${MARK_CLOSE}`;
+/**
+ * En lugar del número de cada nota al pie dentro de su propio texto (w:footnoteRef): el visor lo deja vacío y la nota
+ * salía sin su número. Va seguido de un «0» que ocupa el lugar del número hasta que se numeran las notas.
+ */
+export const NOTE_NUMBER_MARK = `${MARK_OPEN}R${MARK_CLOSE}`;
 
 const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -454,6 +475,267 @@ function plainTocLinks(doc: XmlDocument, hyperlinkIds: Set<string>): number {
   return count;
 }
 
+// ——— Nombres de letra que el navegador leería como palabras de CSS ———
+
+/**
+ * Nombres de letra que en CSS son palabras reservadas o familias genéricas: un estilo pegado de una página web puede
+ * decir que su letra es «inherit». Word no tiene esa letra y usa la que su tabla de fuentes da como alternativa
+ * (w:altName); el navegador, en cambio, lo lee como «heredar» y termina en otra letra (la configuración general).
+ */
+const CSS_FONT_WORDS = new Set([
+  "inherit",
+  "initial",
+  "unset",
+  "revert",
+  "revert-layer",
+  "default",
+  "serif",
+  "sans-serif",
+  "monospace",
+  "cursive",
+  "fantasy",
+  "system-ui",
+  "math",
+  "emoji",
+  "fangsong",
+]);
+
+/** Para cada nombre de esos, la letra que usaría Word: la alternativa de la tabla de fuentes, o una según su familia. */
+function keywordFontReplacements(fontTable: XmlDocument | null): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const font of fontTable ? descendants(fontTable, "font") : []) {
+    const name = attr(font, "name");
+    if (!CSS_FONT_WORDS.has(name.trim().toLowerCase())) continue;
+    const alt = attr(children(font, "altName")[0], "val").trim();
+    const family = attr(children(font, "family")[0], "val");
+    const fallback = family === "swiss" ? "Arial" : family === "modern" ? "Courier New" : "Times New Roman";
+    out.set(name.trim().toLowerCase(), alt && !CSS_FONT_WORDS.has(alt.toLowerCase()) ? alt : fallback);
+  }
+  return out;
+}
+
+const FONT_ATTRIBUTES = ["ascii", "hAnsi", "eastAsia", "cs"];
+
+/** Cambia esos nombres en los w:rFonts de una parte ya leída. Devuelve cuántos cambió. */
+function replaceKeywordFonts(doc: XmlDocument, replacements: Map<string, string>): number {
+  let count = 0;
+  for (const fonts of descendants(doc, "rFonts")) {
+    for (const name of FONT_ATTRIBUTES) {
+      const value = attr(fonts, name).trim().toLowerCase();
+      if (!value || !CSS_FONT_WORDS.has(value)) continue;
+      fonts.setAttributeNS(W, `w:${name}`, replacements.get(value) ?? "Times New Roman");
+      count += 1;
+    }
+  }
+  return count;
+}
+
+// ——— Párrafos vacíos y tabulaciones: datos para después de dibujar ———
+
+type ParagraphStyle = { basedOn: string; tabs: XmlElement[] };
+type ParagraphStyles = { byId: Map<string, ParagraphStyle>; defaultId: string };
+
+function readParagraphStyles(styles: XmlDocument | null): ParagraphStyles {
+  const byId = new Map<string, ParagraphStyle>();
+  let defaultId = "";
+  for (const style of styles ? descendants(styles, "style") : []) {
+    if (attr(style, "type") !== "paragraph") continue;
+    const id = attr(style, "styleId");
+    if (!id) continue;
+    if (isOnValue(attr(style, "default"))) defaultId = id;
+    const pPr = children(style, "pPr")[0];
+    const tabs = pPr ? children(pPr, "tabs")[0] : undefined;
+    byId.set(id, { basedOn: attr(children(style, "basedOn")[0], "val"), tabs: tabs ? children(tabs, "tab") : [] });
+  }
+  return { byId, defaultId };
+}
+
+export type TabStopMark = { pos: number; align: string; leader: string };
+
+/** Las tabulaciones de un párrafo: las de su estilo (y los estilos en que se basa) y después las propias. */
+function paragraphTabStops(paragraph: XmlElement, styles: ParagraphStyles): TabStopMark[] {
+  const pPr = children(paragraph, "pPr")[0];
+  const chain: XmlElement[][] = [];
+  let id = attr(children(pPr ?? paragraph, "pStyle")[0], "val") || styles.defaultId;
+  const seen = new Set<string>();
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const style = styles.byId.get(id);
+    if (!style) break;
+    chain.unshift(style.tabs);
+    id = style.basedOn;
+  }
+  const own = pPr ? children(pPr, "tabs")[0] : undefined;
+  if (own) chain.push(children(own, "tab"));
+  const stops = new Map<number, TabStopMark>();
+  for (const tabs of chain) {
+    for (const tab of tabs) {
+      const twips = Number.parseInt(attr(tab, "pos"), 10);
+      if (!Number.isFinite(twips)) continue;
+      const align = attr(tab, "val") || "left";
+      if (align === "clear") stops.delete(twips);
+      else stops.set(twips, { pos: twips / 20, align, leader: attr(tab, "leader") || "none" });
+    }
+  }
+  return [...stops.entries()].sort((a, b) => a[0] - b[0]).map(([, stop]) => stop);
+}
+
+/** Lo que ocupa lugar en un renglón: si un párrafo no tiene nada de esto, es un párrafo vacío. */
+const LINE_CONTENT = new Set([
+  "tab",
+  "ptab",
+  "br",
+  "cr",
+  "drawing",
+  "pict",
+  "object",
+  "sym",
+  "noBreakHyphen",
+  "softHyphen",
+  "footnoteReference",
+  "endnoteReference",
+  "separator",
+  "continuationSeparator",
+]);
+
+function hasLineContent(paragraph: XmlElement): boolean {
+  for (const run of descendants(paragraph, "r")) {
+    for (const child of children(run)) {
+      const name = localName(child);
+      if (name === "t" ? Boolean(child.textContent) : LINE_CONTENT.has(name)) return true;
+    }
+  }
+  return anyDescendants(paragraph, "drawing").length > 0 || anyDescendants(paragraph, "pict").length > 0;
+}
+
+/** Un tramo nuevo al final o al principio del párrafo, con ese texto y una copia de esas propiedades de letra. */
+function markRun(doc: XmlDocument, text: string, props?: XmlElement): XmlElement {
+  const run = make(doc, W, "w:r");
+  if (props) {
+    const copy = props.cloneNode(true) as XmlElement;
+    // Las marcas de revisión de la marca de párrafo no son letra.
+    for (const child of children(copy)) {
+      if (["ins", "del", "moveFrom", "moveTo", "rPrChange"].includes(localName(child))) copy.removeChild(child);
+    }
+    run.appendChild(copy);
+  }
+  run.appendChild(newText(doc, text));
+  return run;
+}
+
+/**
+ * Deja dos datos para después de dibujar: en cada párrafo vacío, la letra de su marca de párrafo; en cada párrafo con
+ * tabulaciones a la derecha, al centro o decimales, sus tabulaciones (el visor las calcula mal cuando lo que sigue no
+ * entra en el renglón). Devuelve cuántos párrafos marcó.
+ */
+function markParagraphs(doc: XmlDocument, styles: ParagraphStyles): number {
+  let count = 0;
+  for (const paragraph of descendants(doc, "p")) {
+    if (inChoice(paragraph)) continue;
+    const pPr = children(paragraph, "pPr")[0];
+    if (!hasLineContent(paragraph)) {
+      const props = pPr ? children(pPr, "rPr")[0] : undefined;
+      if (props) {
+        paragraph.appendChild(markRun(doc, EMPTY_PARAGRAPH_MARK, props));
+        count += 1;
+      }
+      continue;
+    }
+    const usesTab = descendants(paragraph, "tab").some((tab) => tab.parentNode && localName(tab.parentNode as XmlElement) === "r");
+    if (!usesTab) continue;
+    const stops = paragraphTabStops(paragraph, styles);
+    if (!stops.some((stop) => stop.align === "right" || stop.align === "end" || stop.align === "center" || stop.align === "decimal")) continue;
+    const payload = stops.map((stop) => `${Math.round(stop.pos * 100) / 100}:${stop.align}:${stop.leader}`).join(";");
+    const run = markRun(doc, `${TABS_MARK_OPEN}${payload}${MARK_CLOSE}`);
+    const first = children(paragraph).find((child) => localName(child) !== "pPr");
+    if (first) paragraph.insertBefore(run, first);
+    else paragraph.appendChild(run);
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Agrega al final del documento la muestra del separador de notas (NOTE_SEPARATOR_MARK) si el libro tiene notas al pie:
+ * las propiedades del párrafo del separador del Word y un tramo con la marca (con la letra de ese párrafo, como el
+ * separador). Devuelve si la agregó.
+ */
+function addNoteSeparatorProbe(doc: XmlDocument, footnotes: XmlDocument | null): boolean {
+  if (!footnotes || !descendants(doc, "footnoteReference").length) return false;
+  const separator = descendants(footnotes, "footnote").find((note) => attr(note, "type") === "separator");
+  const source = separator ? descendants(separator, "p")[0] : undefined;
+  const body = descendants(doc, "body")[0];
+  if (!source || !body) return false;
+  const paragraph = make(doc, W, "w:p");
+  const pPr = children(source, "pPr")[0];
+  if (pPr) {
+    const copy = pPr.cloneNode(true) as XmlElement;
+    for (const child of children(copy)) if (["sectPr", "pPrChange"].includes(localName(child))) copy.removeChild(child);
+    paragraph.appendChild(copy);
+  }
+  paragraph.appendChild(markRun(doc, NOTE_SEPARATOR_MARK));
+  const last = children(body, "sectPr")[0];
+  body.insertBefore(paragraph, last ?? null);
+  return true;
+}
+
+/**
+ * Los estilos de carácter que suben o bajan el texto (w:vertAlign: superíndice o subíndice), con lo heredado de los
+ * estilos en que se basan. El visor no lee esa propiedad en los estilos, solo escrita en el texto.
+ */
+function vertAlignStyles(styles: XmlDocument | null): Map<string, string> {
+  const own = new Map<string, { basedOn: string; value: string }>();
+  for (const style of styles ? descendants(styles, "style") : []) {
+    if (attr(style, "type") !== "character") continue;
+    const rPr = children(style, "rPr")[0];
+    own.set(attr(style, "styleId"), {
+      basedOn: attr(children(style, "basedOn")[0], "val"),
+      value: rPr ? attr(children(rPr, "vertAlign")[0], "val") : "",
+    });
+  }
+  const out = new Map<string, string>();
+  for (const id of own.keys()) {
+    const seen = new Set<string>();
+    for (let current: string | undefined = id; current && !seen.has(current); current = own.get(current)?.basedOn) {
+      seen.add(current);
+      const value = own.get(current)?.value;
+      if (value) {
+        if (value !== "baseline") out.set(id, value);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * A los tramos con un estilo de superíndice o subíndice les escribe esa propiedad en el texto, para que el visor la
+ * dibuje (el número de cada nota en su propio texto, «m²» con un estilo…). Las llamadas a notas no: el visor ya las sube.
+ */
+function applyStyleVertAlign(doc: XmlDocument, byStyle: Map<string, string>): number {
+  if (!byStyle.size) return 0;
+  let count = 0;
+  for (const run of descendants(doc, "r")) {
+    const rPr = children(run, "rPr")[0];
+    const value = rPr ? byStyle.get(attr(children(rPr, "rStyle")[0], "val")) : undefined;
+    if (!rPr || !value || children(rPr, "vertAlign").length) continue;
+    if (children(run).some((child) => ["footnoteReference", "endnoteReference"].includes(localName(child)))) continue;
+    rPr.appendChild(make(doc, W, "w:vertAlign", { "w:val": value }));
+    count += 1;
+  }
+  return count;
+}
+
+/** Cambia cada w:footnoteRef (el número de la nota en su texto) por la marca y un «0» provisorio, en su mismo tramo. */
+function markNoteNumbers(doc: XmlDocument): number {
+  let count = 0;
+  for (const ref of descendants(doc, "footnoteRef")) {
+    ref.parentNode?.replaceChild(newText(doc, `${NOTE_NUMBER_MARK}0`), ref);
+    count += 1;
+  }
+  return count;
+}
+
 // ——— Marcas para la paginación: saltos manuales, filas de título y páginas de muestra ———
 
 /** Lo que se ve en un renglón (para saber si un salto de página manual deja algo después en el mismo párrafo). */
@@ -816,7 +1098,16 @@ export async function prepareRenderCopy(
     }
   }
 
-  const hyperlinkIds = hyperlinkStyleIds(await readXml(zip, "word/styles.xml"));
+  // Letras con nombre de palabra de CSS («inherit»): la que usaría Word, en los estilos, la numeración y el texto.
+  const fontWords = keywordFontReplacements(await readXml(zip, "word/fontTable.xml"));
+  for (const name of ["word/styles.xml", "word/numbering.xml"]) {
+    const part = await readXml(zip, name);
+    if (part && replaceKeywordFonts(part, fontWords)) zip.file(name, serialize(part));
+  }
+  const stylesDoc = await readXml(zip, "word/styles.xml");
+  const hyperlinkIds = hyperlinkStyleIds(stylesDoc);
+  const paragraphStyles = readParagraphStyles(stylesDoc);
+  const raised = vertAlignStyles(stylesDoc);
   const parts = Object.keys(zip.files).filter((name) => WHERE.some(([pattern]) => pattern.test(name)));
   for (const name of parts) {
     const doc = await readXml(zip, name);
@@ -842,12 +1133,17 @@ export async function prepareRenderCopy(
       if (body) markManualBreaks(body);
       markHeaderRows(doc);
       addProbes(doc, sections, evenAndOdd);
+      addNoteSeparatorProbe(doc, await readXml(zip, "word/footnotes.xml"));
       if (descendants(doc, "endnoteReference").some((ref) => isOnValue(attr(ref, "customMarkFollows")))) {
         warnings.push("Una nota final usa un símbolo propio en vez de número: en la vista previa puede salir también con número.");
       }
     }
     fixHyphens(doc);
+    if (name === "word/footnotes.xml") markNoteNumbers(doc);
+    applyStyleVertAlign(doc, raised);
+    replaceKeywordFonts(doc, fontWords);
     plainTocLinks(doc, hyperlinkIds);
+    markParagraphs(doc, paragraphStyles);
     const found = nothingFound();
     convertVml(doc, found);
     findDrawings(doc, found);

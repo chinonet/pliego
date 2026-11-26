@@ -6,12 +6,16 @@ import {
   BREAK_MARK,
   cropToPercent,
   DEFAULT_RENDER_INFO,
+  EMPTY_PARAGRAPH_MARK,
   FOOTNOTE_CUSTOM_MARK,
   HEADER_ROW_MARK,
   lengthToEmu,
+  NOTE_NUMBER_MARK,
+  NOTE_SEPARATOR_MARK,
   prepareRenderCopy,
   PROBE_MARK,
   suppressesSpaceAfterManualBreak,
+  TABS_MARK_OPEN,
 } from "./render-copy.ts";
 
 const WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -234,5 +238,70 @@ assert.ok(tocParagraphs[5]!.includes('w:rStyle w:val="Hyperlink"'), "un campo HY
 assert.ok(!tocParagraphs[6]!.includes("rStyle"), "dentro del campo TOC");
 assert.ok(!tocParagraphs[7]!.includes("rStyle"), "dentro del campo TOC, en el párrafo siguiente");
 assert.ok(tocParagraphs[8]!.includes('w:rStyle w:val="Hyperlink"'), "después de cerrar el índice, igual que en el Word");
+
+// Una letra llamada «inherit» (estilo pegado de una web): la alternativa de la tabla de fuentes, como hace Word.
+const words = new JSZip();
+words.file(
+  "word/fontTable.xml",
+  `${HEAD}<w:fonts ${NS}><w:font w:name="inherit"><w:altName w:val="Cambria"/><w:family w:val="roman"/></w:font><w:font w:name="serif"><w:family w:val="swiss"/></w:font></w:fonts>`,
+);
+words.file(
+  "word/styles.xml",
+  `${HEAD}<w:styles ${NS}><w:style w:type="paragraph" w:styleId="adivinanza"><w:rPr><w:rFonts w:ascii="inherit" w:eastAsia="Times New Roman" w:hAnsi="inherit"/><w:i/></w:rPr></w:style></w:styles>`,
+);
+words.file(
+  "word/document.xml",
+  `${HEAD}<w:document ${NS}><w:body><w:p><w:r><w:rPr><w:rFonts w:ascii="serif" w:hAnsi="Georgia"/></w:rPr><w:t>Hola</w:t></w:r></w:p></w:body></w:document>`,
+);
+const wordsOut = await JSZip.loadAsync((await prepareRenderCopy(await words.generateAsync({ type: "uint8array" }))).bytes);
+const wordsStyles = await wordsOut.file("word/styles.xml")!.async("string");
+assert.ok(wordsStyles.includes('w:ascii="Cambria"') && wordsStyles.includes('w:hAnsi="Cambria"'), wordsStyles);
+assert.ok(wordsStyles.includes('w:eastAsia="Times New Roman"'), "las demás quedan");
+const wordsBody = await wordsOut.file("word/document.xml")!.async("string");
+assert.ok(wordsBody.includes('w:ascii="Arial"'), "sin alternativa: según su familia (swiss → Arial)");
+assert.ok(wordsBody.includes('w:hAnsi="Georgia"'));
+
+// Datos para después de dibujar: la letra de la marca de un párrafo vacío, las tabulaciones a la derecha (con las del
+// estilo y las que se borran), la muestra del separador de notas y el lugar del número de cada nota.
+const after = new JSZip();
+after.file(
+  "word/styles.xml",
+  `${HEAD}<w:styles ${NS}>` +
+    `<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr></w:style>` +
+    `<w:style w:type="paragraph" w:styleId="TOC1"><w:basedOn w:val="Normal"/><w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="7191"/></w:tabs></w:pPr></w:style>` +
+    `<w:style w:type="character" w:styleId="FootnoteReference"><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>` +
+    `<w:style w:type="character" w:styleId="Llamada"><w:basedOn w:val="FootnoteReference"/></w:style>` +
+    `</w:styles>`,
+);
+after.file(
+  "word/footnotes.xml",
+  `${HEAD}<w:footnotes ${NS}><w:footnote w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:footnote>` +
+    `<w:footnote w:id="1"><w:p><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> Nota.</w:t></w:r></w:p></w:footnote></w:footnotes>`,
+);
+after.file(
+  "word/document.xml",
+  `${HEAD}<w:document ${NS}><w:body>` +
+    `<w:p><w:pPr><w:rPr><w:rFonts w:ascii="Candara"/><w:sz w:val="16"/><w:ins w:id="1" w:author="x"/></w:rPr></w:pPr></w:p>` +
+    `<w:p><w:pPr><w:pStyle w:val="TOC1"/><w:tabs><w:tab w:val="clear" w:pos="720"/></w:tabs></w:pPr><w:r><w:t>TÍTULO</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>11</w:t></w:r></w:p>` +
+    `<w:p><w:r><w:t>Sin tabulación</w:t></w:r><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="1"/></w:r><w:r><w:rPr><w:rStyle w:val="Llamada"/></w:rPr><w:t>2</w:t></w:r></w:p>` +
+    `<w:sectPr/></w:body></w:document>`,
+);
+const afterOut = await JSZip.loadAsync((await prepareRenderCopy(await after.generateAsync({ type: "uint8array" }))).bytes);
+const afterBody = await afterOut.file("word/document.xml")!.async("string");
+const afterParagraphs = afterBody.split("<w:p>").slice(1);
+assert.ok(afterParagraphs[0]!.includes(EMPTY_PARAGRAPH_MARK), "párrafo vacío: marca con la letra de su marca de párrafo");
+assert.ok(/<w:r><w:rPr><w:rFonts w:ascii="Candara"\/><w:sz w:val="16"\/><\/w:rPr><w:t[^>]*>/.test(afterParagraphs[0]!), afterParagraphs[0]);
+const tabsAt = afterParagraphs[1]!.indexOf(TABS_MARK_OPEN);
+assert.ok(tabsAt >= 0 && tabsAt < afterParagraphs[1]!.indexOf("TÍTULO"), "las tabulaciones van al principio");
+assert.ok(afterParagraphs[1]!.includes(`${TABS_MARK_OPEN}359.55:right:dot`), afterParagraphs[1]);
+assert.ok(!afterParagraphs[1]!.includes("36:left"), "la del estilo Normal se borró con clear");
+assert.ok(!afterParagraphs[2]!.includes(TABS_MARK_OPEN), "sin tabulación a la derecha no hay marca");
+assert.ok(afterBody.includes(NOTE_SEPARATOR_MARK), "muestra del separador de notas");
+assert.ok(afterBody.indexOf(NOTE_SEPARATOR_MARK) < afterBody.indexOf("<w:sectPr"), "antes del sectPr final");
+const afterNotes = await afterOut.file("word/footnotes.xml")!.async("string");
+assert.ok(afterNotes.includes(`${NOTE_NUMBER_MARK}0`) && !afterNotes.includes("footnoteRef"), afterNotes);
+assert.ok(afterNotes.includes('<w:rStyle w:val="FootnoteReference"/><w:vertAlign w:val="superscript"/>'), "el número de la nota, en superíndice");
+assert.ok(afterParagraphs[2]!.includes('<w:rStyle w:val="Llamada"/><w:vertAlign w:val="superscript"/>'), "heredado del estilo base");
+assert.equal(afterParagraphs[2]!.split("vertAlign").length - 1, 1, "la llamada a la nota no (el visor ya la sube)");
 
 console.log("render-copy ok");

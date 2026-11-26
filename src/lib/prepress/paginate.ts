@@ -84,6 +84,31 @@ function notesList(page: HTMLElement): HTMLElement | null {
   return childrenOf(page, "ol")[0] ?? null;
 }
 
+/**
+ * La raya que separa el texto de las notas al pie, como la dibuja Word: 2 pulgadas (144 pt) desde el borde de la
+ * columna, a la altura del renglón del separador (cuyo alto ya reserva el estilo de la lista de notas). Va después de
+ * paginar; no ocupa lugar. `height`: alto del renglón del separador, en px de la hoja.
+ */
+export function drawNoteSeparators(root: HTMLElement, height: number): number {
+  if (!(height > 0)) return 0;
+  let drawn = 0;
+  for (const page of pagesOf(root)) {
+    for (const old of childrenOf(page, "div").filter((div) => div.classList.contains("pliego-separador"))) old.remove();
+    const notes = notesList(page);
+    if (!notes || !notes.querySelector("li")) continue;
+    const column = childrenOf(page, "article")[0] ?? notes;
+    if (getComputedStyle(page).position === "static") page.style.position = "relative";
+    const line = page.ownerDocument.createElement("div");
+    line.className = "pliego-separador";
+    line.style.cssText =
+      `position:absolute;left:${column.offsetLeft}px;top:${(notes.offsetTop + height * 0.6).toFixed(2)}px;` +
+      "width:144pt;height:0;border-top:0.5pt solid #000;margin:0;padding:0;pointer-events:none;";
+    page.insertBefore(line, notes);
+    drawn += 1;
+  }
+  return drawn;
+}
+
 /** Página en blanco que se agregó para que una sección empiece en página impar o par. */
 function isBlank(page: HTMLElement): boolean {
   return page.dataset.pliegoBlank !== undefined;
@@ -200,7 +225,29 @@ export function takeMarks(root: HTMLElement): PageMap {
     templates.set(current, slots);
   });
   for (const page of probes) page.remove();
+  hangBreakLines(pagesOf(root));
   return { section, first, templates, endnotes };
+}
+
+/**
+ * Un párrafo que empieza con un salto de página manual (un título «ÍNDICE» con el salto adelante) queda partido en dos:
+ * lo de antes del salto, sin nada visible, al final de la página anterior, y el texto en la página nueva. En Word ese
+ * renglón del salto cuelga al pie de la página sin ocupar lugar (ni su espacio anterior): si la página ya estaba llena,
+ * no se agrega una página en blanco. Acá ese pedazo vacío se esconde (queda en el documento, con sus marcadores).
+ */
+function hangBreakLines(pages: HTMLElement[]) {
+  for (let index = 1; index < pages.length; index += 1) {
+    const page = pages[index]!;
+    if (page.dataset.pliegoBreak !== "manual") continue;
+    const lead = childrenOf(page, "article").find((article) => article.children.length > 0)?.firstElementChild as HTMLElement | null;
+    if (!lead || lead.tagName !== "P" || lead.dataset.pliegoCont === undefined) continue;
+    const articles = childrenOf(pages[index - 1]!, "article").filter((article) => article.children.length > 0);
+    const before = articles[articles.length - 1]?.lastElementChild as HTMLElement | null | undefined;
+    if (!before || before.tagName !== "P" || before.className !== lead.className) continue;
+    if ((before.textContent ?? "").trim() || before.querySelector("img, svg, object, canvas")) continue;
+    before.dataset.pliegoBreakLine = "";
+    before.style.display = "none";
+  }
 }
 
 /**
@@ -1038,6 +1085,9 @@ export function numberFootnotes(root: HTMLElement, info: RenderInfo, map: PageMa
       const item = items[i] as HTMLLIElement | undefined;
       sup.textContent = n === null ? "" : String(n);
       if (!item) return;
+      // El número dentro del texto de la nota (donde Word tiene w:footnoteRef), con el estilo de llamada de nota.
+      const slot = item.querySelector<HTMLElement>("[data-pliego-note-number]");
+      if (slot) slot.textContent = n === null ? "" : String(n);
       if (n === null) {
         item.style.listStyleType = "none";
         item.removeAttribute("value");

@@ -29,7 +29,18 @@ import {
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
 import { fixDefaultStyleSelectors } from "@/lib/prepress/docx-css";
-import { applyLayout, mergeContinuous, numberFootnotes, numberPages, repaginate, takeMarks, trimPageBottoms } from "@/lib/prepress/paginate";
+import { fixRightTabs, takeNoteSeparator, takeRenderMarks } from "@/lib/prepress/tab-stops";
+import { canUseLocalFonts, localFontFiles } from "@/lib/prepress/local-fonts";
+import {
+  applyLayout,
+  drawNoteSeparators,
+  mergeContinuous,
+  numberFootnotes,
+  numberPages,
+  repaginate,
+  takeMarks,
+  trimPageBottoms,
+} from "@/lib/prepress/paginate";
 import { DEFAULT_RENDER_INFO, prepareRenderCopy, type RenderInfo } from "@/lib/prepress/render-copy";
 import { fixCroppedImages, prepareForExport } from "@/lib/prepress/prepare-export";
 import { auditDocx, auditRenderedImages, type RenderedImage } from "@/lib/prepress/image-audit";
@@ -163,6 +174,11 @@ export function Studio() {
     if (!current) return [];
     const needed = current.fonts;
     const aliases: Array<{ face: ShelfFace; family: string }> = [];
+    // Un archivo con alguna cara que ya se llama como una fuente del Word no presta su nombre a sus otras caras (en
+    // «cambria.ttc», Cambria Math no pasa a ser «Cambria»).
+    const named = new Set(
+      faces.filter((face) => needed.some((font) => fontKey(face.family) === fontKey(font.name))).map((face) => face.fileName),
+    );
     for (const face of faces) {
       const stem = fontKey(face.fileName.replace(/\.[^.]+$/, ""));
       const byName = needed.filter((font) => fontKey(face.family) === fontKey(font.name));
@@ -172,7 +188,7 @@ export function Studio() {
           return stem === key || stem.startsWith(key);
         })
         .sort((a, b) => fontKey(b.name).length - fontKey(a.name).length);
-      const targets = byName.length ? byName : byFile.slice(0, 1);
+      const targets = byName.length ? byName : named.has(face.fileName) ? [] : byFile.slice(0, 1);
       for (const font of targets) aliases.push({ face, family: font.name });
     }
     return aliases;
@@ -277,6 +293,9 @@ export function Studio() {
       const italic = /font-style:\s*italic/i.test(css) ? "italic" : "normal";
       if (uploaded.has(family.toLowerCase()) || restricted.has(faceKey(family, weight, italic))) node.remove();
     }
+    // Ya con los estilos arreglados y antes de que el visor calcule las tabulaciones: la letra de la marca de cada
+    // párrafo vacío y las tabulaciones a la derecha que dejó anotadas la copia para el visor.
+    takeRenderMarks(body);
     const covered = new Set<string>(uploaded);
     if (substitutesRef.current) for (const face of SUBSTITUTE_FACES) covered.add(face.family.toLowerCase());
     for (const id of ["pliego-substitutes", "pliego-uploaded-fonts"]) {
@@ -314,6 +333,9 @@ export function Studio() {
     // El visor calcula el ancho de los tabuladores (índices con puntos, columnas con tabulador) medio segundo después de
     // dibujar: hay que esperarlo a tamaño real antes de medir las páginas.
     await new Promise((resolve) => setTimeout(resolve, 650));
+    // Las tabulaciones a la derecha (los números de página de un índice) como en Word: el visor las calcula mal cuando
+    // el número no entra después del título.
+    fixRightTabs(body);
     // Interlineado como en Word (alto natural de cada letra), antes de cortar las páginas.
     const metrics = new FontMetricsCache();
     for (const face of shelfRef.current) metrics.addBytes(face.family, face.bytes, face);
@@ -331,6 +353,9 @@ export function Studio() {
       for (const span of paragraph.querySelectorAll<HTMLElement>("span")) span.style.lineHeight = "0";
       paragraph.style.paddingBottom = `${(size * 0.222).toFixed(2)}px`;
     }
+    // El renglón del separador de notas al pie: su alto se reserva arriba de las notas de cada página (como Word).
+    const noteSeparator = takeNoteSeparator(body);
+    body.style.setProperty("--pliego-nota-sep", `${noteSeparator.toFixed(2)}px`);
     const map = takeMarks(body);
     mergeContinuous(body, map, prepared.info);
     repaginate(body, map, prepared.info);
@@ -344,6 +369,7 @@ export function Studio() {
       return Number.isFinite(section) && prepared.info.sections[section + 1]?.type === "continuous";
     });
     fixCroppedImages(body);
+    drawNoteSeparators(body, noteSeparator);
     setTooTall(layout.tooTall);
     const notices = [...prepared.warnings, ...spacing.warnings, ...layout.warnings];
     if (layout.blanks > 0) {
@@ -424,12 +450,12 @@ export function Studio() {
     return /\.(ttf|otf|ttc|otc)$/i.test(fileName);
   }
 
-  async function addFonts(files: File[]) {
+  async function addFonts(files: File[], keep?: (face: ShelfFace) => boolean) {
     const next = [...shelfRef.current];
     const problems: string[] = [];
     for (const file of files) {
       try {
-        const faces = await readFontFile(file);
+        const faces = (await readFontFile(file)).filter((face) => !keep || keep(face));
         for (const face of faces) {
           const slot = `${fontKey(face.family)}:${face.weight}:${face.style}`;
           const index = next.findIndex((item) => `${fontKey(item.family)}:${item.weight}:${item.style}` === slot);
@@ -457,6 +483,31 @@ export function Studio() {
       setPhase("error");
       setStatus("");
       setError(err instanceof Error ? err.message : "No se pudo recomponer con esas fuentes.");
+    }
+  }
+
+  /** Las fuentes del Word que están instaladas en la computadora (las verdaderas, no las parecidas de la app). */
+  async function takeLocalFonts() {
+    const report = reportRef.current;
+    if (!report) return;
+    const families = report.fonts.map((font) => font.name);
+    try {
+      const local = await localFontFiles(families);
+      if (!local.files.length) {
+        setError(`No encontré en esta computadora ninguna de estas fuentes: ${families.join(", ")}. Subí sus archivos.`);
+        return;
+      }
+      const wanted = new Set(families.map(fontKey));
+      await addFonts(local.files, (face) => wanted.has(fontKey(face.family)));
+      if (local.missing.length) {
+        setError(
+          `Se usan las fuentes de la computadora. No están instaladas: ${local.missing.join(", ")}${
+            local.missing.length === 1 ? " (sale con la de la app)." : " (salen con las de la app)."
+          }`,
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "No se pudieron leer las fuentes de la computadora.");
     }
   }
 
@@ -655,7 +706,7 @@ export function Studio() {
             <Upload className="size-5 text-accent" aria-hidden="true" />
             <p className="mt-3 text-sm font-semibold">Suelta el .docx de imprenta</p>
             <p className="mt-1 text-sm leading-snug text-muted">
-              Se aceptan los cambios, se quitan comentarios y se dejan las notas al pie. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app.
+              Se aceptan los cambios, se quitan comentarios y se dejan las notas al pie. Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app; para Calibri, Cambria, Arial, Times y Courier usa unas parecidas del mismo ancho, o las de tu computadora.
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
@@ -763,7 +814,7 @@ export function Studio() {
               pressed={substitutes}
               onClick={() => void toggleSubstitutes()}
               label="Completar las fuentes"
-              hint="Encendido. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app. Si el Word trae su propia fuente incrustada se usa esa, y la de la app solo completa las variantes que falten."
+              hint="Encendido. Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app; para Calibri, Cambria, Arial, Times y Courier usa unas parecidas del mismo ancho, o las de tu computadora. Si el Word trae su propia fuente incrustada se usa esa, y la de la app solo completa las variantes que falten."
             />
             <Toggle
               pressed={fullFont}
@@ -794,7 +845,7 @@ export function Studio() {
               <ul className="grid gap-1 text-sm text-muted">
                 {report.fonts.map((font) => {
                   const uploaded = shelf.filter((face) =>
-                    fontAliases([face], report).some((alias) => alias.family === font.name),
+                    fontAliases(shelf, report).filter((alias) => alias.face === face).some((alias) => alias.family === font.name),
                   );
                   const covered = uploaded.length > 0 || (substitutes && Boolean(font.substitute));
                   const inWord = embeddedRef.current.filter((face) => fontKey(face.family) === fontKey(font.name) && !face.restricted);
@@ -805,7 +856,9 @@ export function Studio() {
                         ? "incrustada en el Word (solo las letras usadas)"
                         : "incrustada en el Word"
                       : substitutes && font.substitute
-                        ? "ya está en la app"
+                        ? fontKey(font.substitute) === fontKey(font.name)
+                          ? "ya está en la app"
+                          : `parecida: ${font.substitute} (mismo ancho)`
                         : font.embedded
                           ? "recorte del Word"
                           : "falta · súbela";
@@ -817,9 +870,47 @@ export function Studio() {
                   );
                 })}
               </ul>
+              {(() => {
+                const lookalikes = report.fonts.filter((font) => {
+                  const uploaded = shelf.some((face) => fontAliases(shelf, report).filter((alias) => alias.face === face).some((alias) => alias.family === font.name));
+                  const inWord = embeddedRef.current.some((face) => fontKey(face.family) === fontKey(font.name) && !face.restricted);
+                  return !uploaded && !inWord && substitutes && font.substitute && fontKey(font.substitute) !== fontKey(font.name);
+                });
+                if (!lookalikes.length) return null;
+                const names = lookalikes.map((font) => font.name);
+                const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} y ${names[names.length - 1]}`;
+                return (
+                  <div className="grid gap-2 rounded-lg border border-line bg-surface px-3 py-3 text-sm">
+                    <p>
+                      {list} {names.length === 1 ? "sale" : "salen"} con {names.length === 1 ? "una letra parecida" : "letras parecidas"}{" "}
+                      de la app: mismo ancho (las páginas se cortan igual), pero el dibujo de las letras no es el mismo.
+                    </p>
+                    {canUseLocalFonts() ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void takeLocalFonts()}
+                          className="rounded-lg border border-accent px-3 py-2.5 text-sm font-semibold text-fg disabled:opacity-40"
+                        >
+                          Usar las fuentes de esta computadora
+                        </button>
+                        <p className="text-muted">
+                          El navegador te pide permiso para ver las fuentes instaladas. Se usan solo en este navegador: no se
+                          suben a ningún lado.
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-muted">
+                        Para usar las verdaderas, subí sus archivos con «Subir fuentes» (en Windows están en C:\Windows\Fonts).
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
               {report.fonts.some((font) => {
                 const uploaded = shelf.some((face) =>
-                  fontAliases([face], report).some((alias) => alias.family === font.name),
+                  fontAliases(shelf, report).filter((alias) => alias.face === face).some((alias) => alias.family === font.name),
                 );
                 return !uploaded && !(substitutes && font.substitute);
               }) ? (
@@ -832,7 +923,7 @@ export function Studio() {
                   Subir las que faltan
                 </button>
               ) : (
-                <p className="text-sm text-muted">Esas fuentes van enteras dentro del PDF.</p>
+                <p className="text-sm text-muted">Esas fuentes van dentro del PDF.</p>
               )}
             </div>
           ) : null}
@@ -841,7 +932,7 @@ export function Studio() {
             <ul className="grid gap-1 text-sm">
               {shelf.map((face) => {
                 const usedAs = report
-                  ? fontAliases([face], report)
+                  ? fontAliases(shelf, report).filter((alias) => alias.face === face)
                       .map((alias) => alias.family)
                       .filter((family) => fontKey(family) !== fontKey(face.family))
                   : [];

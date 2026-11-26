@@ -11,6 +11,8 @@ import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
 // @ts-expect-error JS plugin alongside the TS vite config
 import { appEnvPlugin } from "./scripts/app-env-plugin.mjs";
 import { isMigrationFile } from "./scripts/migration-plan.mjs";
+// @ts-expect-error JS plugin alongside the TS vite config
+import { jsafaFeaturesPlugin } from "./scripts/jsafa-features-plugin.mjs";
 
 /** The files `src/lib/db.ts` globs — same directory, same non-recursive scope. */
 function hasGlobbedMigrations(root: string): boolean {
@@ -157,7 +159,11 @@ export default defineConfig(({ command, isPreview }) => ({
     strictPort: true,
   },
   resolve: { tsconfigPaths: true },
+  // Sin pre-empaquetar jsafa-pdf en desarrollo: así le llega el plugin de las «features» (igual que en el build).
+  optimizeDeps: { exclude: ["jsafa-pdf"] },
   plugins: [
+    // El PDF sin ligaduras ni interletraje, como Word (scripts/jsafa-features-plugin.mjs).
+    jsafaFeaturesPlugin(),
     pgliteBootstrapPlugin(),
     // Before tanstackStart so /auth/popup never falls through to the SPA.
     authPopupPlugin(),

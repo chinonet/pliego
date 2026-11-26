@@ -681,6 +681,16 @@ export async function fixLineSpacing(
     list: style.fontFamily,
     size: px(style.fontSize),
   });
+  // Un párrafo vacío tiene en Word el alto de la letra de su marca de párrafo (la guarda tab-stops.ts al dibujar).
+  const markFace = (p: HTMLElement): Face | null => {
+    try {
+      const mark = JSON.parse(p.dataset.pliegoMarkFont ?? "null") as { list?: unknown; size?: unknown } | null;
+      if (!mark || typeof mark.list !== "string" || typeof mark.size !== "number" || !(mark.size > 0)) return null;
+      return { family: firstFamily(mark.list), list: mark.list, size: mark.size };
+    } catch {
+      return null;
+    }
+  };
   const reads: Read[] = paragraphs.map((p, index) => {
     const style = view.getComputedStyle(p);
     const spans = ([...p.querySelectorAll("span")] as HTMLElement[])
@@ -690,7 +700,7 @@ export async function fixLineSpacing(
       p,
       rule: parseDeclaredLineHeight(declaredLineHeight(p, rules)),
       own: faceOf(style),
-      base: faceOf(view.getComputedStyle(probes[index]!)),
+      base: markFace(p) ?? faceOf(view.getComputedStyle(probes[index]!)),
       spans,
       top: px(style.marginTop),
       bottom: px(style.marginBottom),
@@ -763,14 +773,6 @@ export async function fixLineSpacing(
     if (Math.abs(margin.top - read.top) > 0.01) p.style.marginTop = round(margin.top);
     if (Math.abs(margin.bottom - read.bottom) > 0.01) p.style.marginBottom = round(margin.bottom);
     if (rule.kind === "other") continue;
-    // La letra del párrafo pasa a ser la de su texto: si no, el «puntal» de cada renglón usa la letra de la app y
-    // agranda los renglones.
-    if (read.own.list !== read.base.list) p.style.fontFamily = read.base.list;
-    if (Math.abs(read.own.size - read.base.size) > 0.01) p.style.fontSize = round(read.base.size);
-    if (rule.kind === "exact") {
-      changed += 1;
-      continue;
-    }
     const lineFor = (face: Face): number | null => {
       const ratio = ratios.get(face.family);
       if (!ratio || !(face.size > 0)) return null;
@@ -778,12 +780,23 @@ export async function fixLineSpacing(
       return wordLinePx(rule, ratio, face.size);
     };
     // Word mide cada renglón con la letra de su texto (la mayor de la línea); la del párrafo solo cuenta si no hay
-    // texto. Por eso el mínimo del párrafo es el renglón más bajo entre sus letras, y cada tramo lleva el suyo.
-    const textLines = read.spans
-      .filter((span) => span.el.textContent?.trim())
-      .map((span) => lineFor(span.face))
-      .filter((value): value is number => value !== null);
-    const line = textLines.length ? Math.min(...textLines) : lineFor(read.base);
+    // texto. Por eso el mínimo del párrafo es el renglón más bajo entre sus letras, y cada tramo lleva el suyo. Un
+    // tramo de solo espacios también es texto para Word (un renglón de espacios en letra chica es chico).
+    const texts = read.spans
+      .filter((span) => (span.el.textContent ?? "").length > 0)
+      .map((span) => ({ face: span.face, line: rule.kind === "exact" ? null : lineFor(span.face) }));
+    const measured = texts.filter((text): text is { face: Face; line: number } => text.line !== null);
+    const lowest = measured.length ? measured.reduce((a, b) => (b.line < a.line ? b : a)) : null;
+    // La letra del párrafo (el «puntal» invisible de cada renglón) pasa a ser la de su texto: si quedara la del estilo
+    // y es más grande (un catálogo en letra chica dentro de un párrafo «Normal»), cada renglón sale más alto.
+    const strut = lowest?.face ?? texts[0]?.face ?? read.base;
+    if (read.own.list !== strut.list) p.style.fontFamily = strut.list;
+    if (Math.abs(read.own.size - strut.size) > 0.01) p.style.fontSize = round(strut.size);
+    if (rule.kind === "exact") {
+      changed += 1;
+      continue;
+    }
+    const line = lowest ? lowest.line : lineFor(read.base);
     if (line === null) continue;
     p.style.lineHeight = round(line);
     p.style.minHeight = round(line);

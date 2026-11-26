@@ -55,6 +55,19 @@
   hyphens: manual !important;
 }
 
+/* Sin interletraje (kerning) ni ligaduras, como Word salvo que el texto los pida: el navegador los aplica solos y
+   achica las palabras (en mayúsculas, «LA», «AV»…), así los renglones y las páginas se cortan distinto que en Word. */
+.pliego-stage section.docx {
+  font-kerning: none;
+  font-variant-ligatures: none;
+}
+
+/* Las notas al pie empiezan debajo del renglón del separador, como en Word (la raya la dibuja drawNoteSeparators). El
+   alto lo mide la composición con la letra del separador del Word. */
+.pliego-stage section.docx > ol {
+  padding-top: var(--pliego-nota-sep, 0px);
+}
+
 /* Columnas: quedan equilibradas, como las deja el navegador. column-fill: auto acá no sirve (sin alto fijo no hace
    nada) y con alto fijo el texto que sobra se va a columnas fuera de la hoja sin que la repaginación lo vea. El llenado
    en orden, como Word, lo hace la composición después de repaginar y solo donde entra todo. */

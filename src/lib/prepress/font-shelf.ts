@@ -1,4 +1,4 @@
-import { parseFontFaces, type ParsedFace } from "@/lib/prepress/font-face";
+import { extractCollectionFace, parseFontFaces, type ParsedFace } from "@/lib/prepress/font-face";
 
 export type ShelfFace = ParsedFace & {
   id: string;
@@ -69,9 +69,10 @@ export async function forgetFace(id: string) {
 export async function readFontFile(file: File): Promise<ShelfFace[]> {
   if (file.size > 32 * 1024 * 1024) throw new Error(`${file.name} pasa de 32 MB.`);
   const bytes = new Uint8Array(await file.arrayBuffer());
+  // De una colección (TTC), cada cara va como su propio archivo: el navegador y el PDF usan esa y no la primera.
   return parseFontFaces(bytes).map((face, index) => ({
     ...face,
-    bytes,
+    bytes: extractCollectionFace(bytes, index),
     fileName: file.name,
     id: `${file.name}:${index}:${face.family}:${face.weight}:${face.style}`,
   }));

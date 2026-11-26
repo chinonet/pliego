@@ -97,6 +97,52 @@ function parseSfnt(bytes: Uint8Array, base: number): ParsedFace {
   return { family, subfamily, weight, style };
 }
 
+/**
+ * Una cara de una colección (TTC/OTC, como «cambria.ttc», que trae Cambria y Cambria Math) como archivo TTF/OTF
+ * propio: las mismas tablas, copiadas byte a byte, con su propio índice. El navegador y el PDF no siempre saben elegir
+ * una cara dentro de una colección. Si no es una colección, devuelve los mismos bytes.
+ */
+export function extractCollectionFace(bytes: Uint8Array, index: number): Uint8Array {
+  if (tag(bytes, 0) !== "ttcf") return bytes;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint32(8);
+  if (index < 0 || index >= count) throw new Error("La colección no tiene esa cara.");
+  const base = view.getUint32(12 + index * 4);
+  const numTables = view.getUint16(base + 4);
+  const records: Array<{ offset: number; length: number; tag: string }> = [];
+  for (let i = 0; i < numTables; i++) {
+    const rec = base + 12 + i * 16;
+    const offset = view.getUint32(rec + 8);
+    const length = view.getUint32(rec + 12);
+    if (offset + length > bytes.length) throw new Error("La colección está dañada.");
+    records.push({ offset, length, tag: tag(bytes, rec) });
+  }
+  const header = 12 + numTables * 16;
+  const size = records.reduce((sum, record) => sum + ((record.length + 3) & ~3), header);
+  const out = new Uint8Array(size);
+  const ov = new DataView(out.buffer);
+  out.set(bytes.subarray(base, base + 12), 0);
+  let at = header;
+  let headAt = -1;
+  records.forEach((record, i) => {
+    const rec = 12 + i * 16;
+    out.set(bytes.subarray(base + 12 + i * 16, base + 12 + i * 16 + 8), rec); // etiqueta y suma de la tabla
+    ov.setUint32(rec + 8, at);
+    ov.setUint32(rec + 12, record.length);
+    out.set(bytes.subarray(record.offset, record.offset + record.length), at);
+    if (record.tag === "head") headAt = at;
+    at += (record.length + 3) & ~3;
+  });
+  // La suma de control del archivo entero (head.checkSumAdjustment) cambia con el archivo nuevo.
+  if (headAt >= 0 && headAt + 12 <= out.length) {
+    ov.setUint32(headAt + 8, 0);
+    let sum = 0;
+    for (let i = 0; i < out.length; i += 4) sum = (sum + ov.getUint32(i)) >>> 0;
+    ov.setUint32(headAt + 8, (0xb1b0afba - sum) >>> 0);
+  }
+  return out;
+}
+
 /** Lee TTF, OTF y colecciones TTC. No recomprime ni convierte el archivo. */
 export function parseFontFaces(bytes: Uint8Array): ParsedFace[] {
   if (bytes.byteLength < 12) throw new Error("Archivo de fuente vacío.");
