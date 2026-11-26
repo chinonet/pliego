@@ -30,7 +30,7 @@ export async function exportPagesToPdf(
 ): Promise<PdfExport> {
   const { toPdf } = await import("jsafa-pdf");
   const lib = await import("pdf-lib");
-  const { PDFDocument, rgb } = lib;
+  const { PDFDocument, grayscale } = lib;
 
   if (sections.length === 0) throw new Error("El documento no tiene páginas para exportar.");
 
@@ -53,7 +53,7 @@ export async function exportPagesToPdf(
       // El corte es la página del Word, con o sin marcas alrededor.
       page.setTrimBox(0, 0, width, height);
       page.setBleedBox(0, 0, width, height);
-      if (opts.cropMarks) drawCropMarks(page, rgb);
+      if (opts.cropMarks) drawCropMarks(page, grayscale);
       merged.addPage(page);
     }
   }
@@ -75,7 +75,7 @@ export async function exportPagesToPdf(
 /** Marcas de corte en vectores, fuera del recorte. No tocan las imágenes. */
 function drawCropMarks(
   page: import("pdf-lib").PDFPage,
-  rgb: typeof import("pdf-lib").rgb,
+  grayscale: typeof import("pdf-lib").grayscale,
 ) {
   const width = page.getWidth();
   const height = page.getHeight();
@@ -83,7 +83,7 @@ function drawCropMarks(
   const len = 14;
   const pad = gap + len;
   page.setMediaBox(-pad, -pad, width + pad * 2, height + pad * 2);
-  const ink = rgb(0, 0, 0);
+  const ink = grayscale(0);
   const lines: Array<[[number, number], [number, number]]> = [
     [[-pad, 0], [-gap, 0]],
     [[0, -pad], [0, -gap]],
@@ -158,6 +158,8 @@ function replaceStream(lib: PdfLib, context: PDFContextType, ref: PDFRefType, di
 /** Reescribe un stream de contenido con los neutros en gris. Devuelve si quedó algún color que no es gris. */
 function rewriteContent(lib: PdfLib, context: PDFContextType, ref: PDFRefType, grayscale: boolean): boolean {
   const stream = context.lookup(ref);
+  // Lo que dibuja pdf-lib en esta etapa (marcas de corte, q/Q) no viene comprimido: solo se revisa.
+  if (stream instanceof lib.PDFContentStream) return COLOR_LEFT.test(stream.getContentsString());
   if (!(stream instanceof lib.PDFRawStream)) return false;
   const raw = lib.decodePDFRawStream(stream).decode();
   let text = "";
@@ -227,6 +229,22 @@ function fontEmbedded(lib: PdfLib, context: PDFContextType, font: PDFDictType): 
   );
 }
 
+/** Una OTF (CFF) entera se incrusta como archivo OpenType completo donde PDF espera solo el programa CFF. */
+function wholeOpenTypeCff(lib: PdfLib, context: PDFContextType, font: PDFDictType): boolean {
+  let target = font;
+  if (nameOf(lib, context, font.get(lib.PDFName.of("Subtype"))) === "Type0") {
+    const descendants = lookup(lib, context, font.get(lib.PDFName.of("DescendantFonts")));
+    const first = descendants instanceof lib.PDFArray ? asDict(lib, context, descendants.get(0)) : undefined;
+    if (!first) return false;
+    target = first;
+  }
+  const descriptor = asDict(lib, context, target.get(lib.PDFName.of("FontDescriptor")));
+  const file = descriptor ? lookup(lib, context, descriptor.get(lib.PDFName.of("FontFile3"))) : undefined;
+  if (!(file instanceof lib.PDFRawStream)) return false;
+  const head = lib.decodePDFRawStream(file).decode().subarray(0, 4);
+  return String.fromCharCode(...head) === "OTTO";
+}
+
 /**
  * Deja el PDF listo para imprenta sin tocar el texto ni recomprimir fotos: neutros en gris, sin anotaciones y, en
  * blanco y negro, las imágenes sin pérdida pasadas a gris. Devuelve lo que impide declararlo PDF/X-1a.
@@ -234,6 +252,7 @@ function fontEmbedded(lib: PdfLib, context: PDFContextType, font: PDFDictType): 
 function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean): string[] {
   const context = doc.context;
   const missingFonts = new Set<string>();
+  const wholeOtf = new Set<string>();
   const colorImages = new Set<number>();
   let colorVectors = false;
   let transparency = false;
@@ -247,6 +266,8 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
       const font = asDict(lib, context, value);
       if (font && !fontEmbedded(lib, context, font)) {
         missingFonts.add(nameOf(lib, context, font.get(lib.PDFName.of("BaseFont"))) ?? "sin nombre");
+      } else if (font && wholeOpenTypeCff(lib, context, font)) {
+        wholeOtf.add(nameOf(lib, context, font.get(lib.PDFName.of("BaseFont"))) ?? "sin nombre");
       }
     }
     const states = asDict(lib, context, resources.get(lib.PDFName.of("ExtGState")));
@@ -304,6 +325,11 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
       `Fuentes sin incrustar: ${[...missingFonts].join(", ")}. La imprenta rechaza el archivo así: subí esas fuentes.`,
     );
   }
+  if (wholeOtf.size) {
+    problems.push(
+      `Fuentes OpenType (OTF) incrustadas enteras: ${[...wholeOtf].join(", ")}. Así no cumplen PDF/X: apagá «Incrustar la fuente entera».`,
+    );
+  }
   if (colorImages.size) {
     const pages = [...colorImages].slice(0, 12).join(", ") + (colorImages.size > 12 ? "…" : "");
     problems.push(
@@ -330,7 +356,8 @@ function declarePdfX1a(lib: PdfLib, doc: PDFDocumentType, title: string) {
   });
   doc.catalog.set(lib.PDFName.of("OutputIntents"), context.obj([intent]));
   const info = infoDict(lib, doc);
-  info.set(lib.PDFName.of("GTS_PDFXVersion"), lib.PDFString.of("PDF/X-1a:2001"));
+  // ISO 15930-1: la versión es «PDF/X-1:2001» y la conformidad «PDF/X-1a:2001».
+  info.set(lib.PDFName.of("GTS_PDFXVersion"), lib.PDFString.of("PDF/X-1:2001"));
   info.set(lib.PDFName.of("GTS_PDFXConformance"), lib.PDFString.of("PDF/X-1a:2001"));
   info.set(lib.PDFName.of("Title"), lib.PDFHexString.fromText(title));
 }

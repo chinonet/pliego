@@ -16,7 +16,7 @@ import { forgetFace, installFontFaces, loadShelf, readFontFile, rememberFace, re
 import { installSubstitutes, loadSubstituteFaces, SUBSTITUTE_FACES } from "@/lib/prepress/substitutes";
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
-import { numberPages, repaginate, takeSectionMarks } from "@/lib/prepress/paginate";
+import { numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -233,7 +233,7 @@ export function Studio() {
     await Promise.all(
       images.map(
         (img) =>
-          img.complete && img.naturalWidth > 0
+          img.complete
             ? Promise.resolve()
             : new Promise<void>((resolve) => {
                 img.addEventListener("load", () => resolve(), { once: true });
@@ -241,9 +241,18 @@ export function Studio() {
               }),
       ),
     );
-    const starts = takeSectionMarks(body);
-    const flow = repaginate(body);
-    numberPages(body, marked.sections, starts);
+    // Antes de medir, todas las fuentes cargadas (también las que el Word trae incrustadas): si no, las páginas se
+    // cortan con las medidas de otra letra.
+    void body.offsetHeight;
+    if ("fonts" in document) {
+      await Promise.all(
+        [...document.fonts].filter((face) => face.status !== "loaded").map((face) => face.load().catch(() => undefined)),
+      );
+      await document.fonts.ready;
+    }
+    const map = takeMarks(body);
+    const flow = repaginate(body, map);
+    numberPages(body, marked.sections, map);
     setTooTall(flow.tooTall);
     const pages = body.querySelectorAll("section.docx").length;
     setPageCount(pages);

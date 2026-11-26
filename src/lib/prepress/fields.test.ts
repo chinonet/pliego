@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import JSZip from "jszip";
-import { markPageFields, PAGE_MARK, PAGES_MARK, sectionMark } from "./fields.ts";
+import { FOOTNOTE_MARK, markPageFields, PAGE_MARK, PAGES_MARK, pageMark, SECTION_PAGES_MARK, sectionMark } from "./fields.ts";
 import { formatPageNumber } from "./paginate.ts";
 import { allToGray, neutralToGray } from "./export-pdf.ts";
 
@@ -10,7 +10,10 @@ const docXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:p><w:r><w:t>Prólogo</w:t></w:r></w:p>
 <w:p><w:pPr><w:sectPr><w:pgNumType w:fmt="lowerRoman"/></w:sectPr></w:pPr><w:r><w:t>Fin del prólogo</w:t></w:r></w:p>
 <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Capítulo 1</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
-<w:sectPr><w:pgNumType w:start="1"/></w:sectPr>
+<w:p><w:pPr><w:sectPr><w:pgNumType w:start="1"/></w:sectPr></w:pPr><w:r><w:t>Nota</w:t><w:footnoteReference w:id="1"/></w:r></w:p>
+<w:bookmarkStart w:id="0" w:name="x"/>
+<w:sdt><w:sdtContent><w:p><w:r><w:lastRenderedPageBreak/><w:t>Capítulo 2</w:t></w:r></w:p></w:sdtContent></w:sdt>
+<w:sectPr/>
 </w:body></w:document>`;
 const footerXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:ftr ${W}><w:p>
@@ -21,6 +24,8 @@ const footerXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:r><w:fldChar w:fldCharType="end"/></w:r>
 <w:r><w:t xml:space="preserve"> de </w:t></w:r>
 <w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>9</w:t></w:r></w:fldSimple>
+<w:fldSimple w:instr=" SECTIONPAGES "><w:r><w:t>4</w:t></w:r></w:fldSimple>
+<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE \* roman </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>ii</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
 <w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
 </w:p></w:ftr>`;
 
@@ -35,15 +40,26 @@ const out = await JSZip.loadAsync(marked.bytes);
 const footer = await out.file("word/footer1.xml")!.async("string");
 const body = await out.file("word/document.xml")!.async("string");
 
-assert.equal(marked.fields, 3, "dos PAGE y un NUMPAGES");
+assert.equal(marked.fields, 5, "dos PAGE, un PAGE romano, NUMPAGES y SECTIONPAGES");
+assert.ok(footer.includes(pageMark("lowerRoman")), "el formato del campo (\* roman) viaja en la marca");
+assert.ok(footer.includes(SECTION_PAGES_MARK), "SECTIONPAGES tiene su propia marca");
 assert.equal(footer.split(PAGE_MARK).length - 1, 2, "cada PAGE queda como una marca");
 assert.ok(footer.includes(PAGES_MARK), "NUMPAGES queda como marca");
 assert.doesNotMatch(footer, /<w:t[^>]*>2<\/w:t>|<w:t[^>]*>0<\/w:t>|<w:t[^>]*>9<\/w:t>/, "sin los números guardados por Word");
 assert.doesNotMatch(footer, /fldSimple/, "el visor no dibuja fldSimple: queda como texto");
 assert.match(footer, /<w:b\/>/, "se conserva el formato del número");
-assert.deepEqual(marked.sections, [{ start: undefined, format: "lowerRoman" }, { start: 1, format: undefined }]);
+assert.deepEqual(marked.sections, [
+  { start: undefined, format: "lowerRoman" },
+  { start: 1, format: undefined },
+  { start: undefined, format: undefined },
+]);
 assert.ok(body.indexOf(sectionMark(0)) < body.indexOf("Prólogo"), "marca al comienzo de la primera sección");
 assert.ok(body.indexOf(sectionMark(1)) < body.indexOf("Capítulo 1"), "marca dentro de la tabla que abre la segunda sección");
+assert.ok(
+  body.indexOf("lastRenderedPageBreak") < body.indexOf(sectionMark(2)) && body.indexOf(sectionMark(2)) < body.indexOf("Capítulo 2"),
+  "la marca va después del salto guardado (y se encuentra aunque haya un marcador y un control de contenido antes)",
+);
+assert.ok(body.indexOf(FOOTNOTE_MARK) < body.indexOf("footnoteReference"), "marca antes de la llamada a nota");
 assert.deepEqual(
   await out.file("word/media/image1.png")!.async("uint8array"),
   new Uint8Array([1, 2, 3, 4]),

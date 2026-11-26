@@ -4,12 +4,17 @@ import { DOMParser, XMLSerializer, type Document as XmlDocument, type Element as
 /**
  * Campos de número de página. El visor muestra el número que Word dejó guardado (el mismo en todas las páginas),
  * así que en una copia que solo sirve para componer se cambian por marcas que después se numeran página por página.
- * El Word limpio que se descarga no pasa por acá.
+ * También se marcan el comienzo de cada sección y las llamadas a notas al pie (para que viajen con su nota si un
+ * párrafo pasa a otra página). El Word limpio que se descarga no pasa por acá.
  */
 export const MARK_OPEN = "";
 export const MARK_CLOSE = "";
-export const PAGE_MARK = `${MARK_OPEN}P${MARK_CLOSE}`;
+/** Número de página; con formato propio del campo (\* roman…) va como «P:lowerRoman». */
+export const pageMark = (format?: string) => `${MARK_OPEN}P${format ? `:${format}` : ""}${MARK_CLOSE}`;
+export const PAGE_MARK = pageMark();
 export const PAGES_MARK = `${MARK_OPEN}N${MARK_CLOSE}`;
+export const SECTION_PAGES_MARK = `${MARK_OPEN}M${MARK_CLOSE}`;
+export const FOOTNOTE_MARK = `${MARK_OPEN}F${MARK_CLOSE}`;
 export const sectionMark = (index: number) => `${MARK_OPEN}S${index}${MARK_CLOSE}`;
 
 export type SectionNumbering = { start?: number; format?: string };
@@ -34,22 +39,44 @@ function descendants(el: XmlElement | XmlDocument, name: string): XmlElement[] {
   return Array.from(el.getElementsByTagNameNS(W, name)) as XmlElement[];
 }
 
-/** «PAGE \* MERGEFORMAT» → PAGE_MARK; «NUMPAGES» / «SECTIONPAGES» → PAGES_MARK. */
+function attr(el: XmlElement | undefined, name: string): string {
+  return el ? el.getAttributeNS(W, name) || el.getAttribute(`w:${name}`) || "" : "";
+}
+
+/** «\* roman» y compañía, como los escribe Word. */
+const SWITCH_FORMATS: Record<string, string> = {
+  roman: "lowerRoman",
+  ROMAN: "upperRoman",
+  alphabetic: "lowerLetter",
+  ALPHABETIC: "upperLetter",
+  arabic: "decimal",
+  Arabic: "decimal",
+};
+
+/** «PAGE \* MERGEFORMAT» → marca de página; NUMPAGES → total; SECTIONPAGES → páginas de la sección. */
 function markFor(instruction: string): string | null {
   const word = instruction.trim().split(/\s+/)[0]?.toUpperCase();
-  if (word === "PAGE") return PAGE_MARK;
-  if (word === "NUMPAGES" || word === "SECTIONPAGES") return PAGES_MARK;
+  if (word === "PAGE") {
+    const format = /\\\*\s*([A-Za-z]+)/.exec(instruction)?.[1];
+    return pageMark(format ? SWITCH_FORMATS[format] : undefined);
+  }
+  if (word === "NUMPAGES") return PAGES_MARK;
+  if (word === "SECTIONPAGES") return SECTION_PAGES_MARK;
   return null;
+}
+
+function newText(doc: XmlDocument, text: string): XmlElement {
+  const t = doc.createElementNS(W, "w:t");
+  t.setAttribute("xml:space", "preserve");
+  t.appendChild(doc.createTextNode(text));
+  return t;
 }
 
 function newRun(doc: XmlDocument, text: string, like?: XmlElement | null): XmlElement {
   const run = doc.createElementNS(W, "w:r");
   const props = like ? children(like, "rPr")[0] : undefined;
   if (props) run.appendChild(props.cloneNode(true));
-  const t = doc.createElementNS(W, "w:t");
-  t.setAttribute("xml:space", "preserve");
-  t.appendChild(doc.createTextNode(text));
-  run.appendChild(t);
+  run.appendChild(newText(doc, text));
   return run;
 }
 
@@ -71,22 +98,35 @@ function replaceResult(doc: XmlDocument, runs: XmlElement[], mark: string, end: 
   if (!placed) end.parentNode?.insertBefore(newRun(doc, mark, end), end);
 }
 
+/** Las corridas de un párrafo en orden, también las que están dentro de un hipervínculo o un control de contenido. */
+function runsOf(paragraph: XmlElement): XmlElement[] {
+  const out: XmlElement[] = [];
+  const walk = (node: XmlElement) => {
+    for (const child of children(node)) {
+      const name = localName(child);
+      if (name === "r") out.push(child);
+      else if (["hyperlink", "sdt", "sdtContent", "smartTag", "customXml", "ins", "fldSimple"].includes(name)) walk(child);
+    }
+  };
+  walk(paragraph);
+  return out;
+}
+
 function markComplexFields(doc: XmlDocument): number {
   let count = 0;
   for (const paragraph of descendants(doc, "p")) {
-    const runs = children(paragraph).flatMap((node) => (localName(node) === "r" ? [node] : children(node, "r")));
     let depth = 0;
     let instruction = "";
     let mark: string | null = null;
     let inResult = false;
     let result: XmlElement[] = [];
-    for (const run of runs) {
+    for (const run of runsOf(paragraph)) {
       const chars = children(run, "fldChar");
       const instr = children(run, "instrText");
       if (depth === 1 && !chars.length && !instr.length && inResult && mark) result.push(run);
       for (const node of instr) if (depth === 1) instruction += node.textContent ?? "";
       for (const char of chars) {
-        const type = char.getAttributeNS(W, "fldCharType") || char.getAttribute("w:fldCharType");
+        const type = attr(char, "fldCharType");
         if (type === "begin") {
           depth += 1;
           if (depth === 1) {
@@ -117,7 +157,7 @@ function markComplexFields(doc: XmlDocument): number {
 function markSimpleFields(doc: XmlDocument): number {
   let count = 0;
   for (const field of descendants(doc, "fldSimple")) {
-    const mark = markFor(field.getAttributeNS(W, "instr") || field.getAttribute("w:instr") || "");
+    const mark = markFor(attr(field, "instr"));
     const parent = field.parentNode;
     if (!parent) continue;
     const runs = children(field, "r");
@@ -133,47 +173,93 @@ function markSimpleFields(doc: XmlDocument): number {
   return count;
 }
 
+/** Una marca justo antes de cada llamada a nota al pie, dentro de la misma corrida. */
+function markFootnoteReferences(doc: XmlDocument) {
+  for (const reference of descendants(doc, "footnoteReference")) {
+    reference.parentNode?.insertBefore(newText(doc, FOOTNOTE_MARK), reference);
+  }
+}
+
+function isPageBreak(node: XmlElement): boolean {
+  const name = localName(node);
+  return name === "lastRenderedPageBreak" || (name === "br" && attr(node, "type") === "page");
+}
+
+/**
+ * La marca de comienzo de sección va en el primer párrafo. Si ese párrafo empieza con el salto de página que Word dejó
+ * guardado, la marca va después del salto: si no, el visor la deja en la última página de la sección anterior.
+ */
+function placeSectionMark(doc: XmlDocument, paragraph: XmlElement, mark: string) {
+  for (const run of runsOf(paragraph)) {
+    const parts = children(run);
+    const breakAt = parts.findIndex(isPageBreak);
+    if (breakAt >= 0) {
+      const after = parts[breakAt]!.nextSibling;
+      const text = newText(doc, mark);
+      if (after) run.insertBefore(text, after);
+      else run.appendChild(text);
+      return;
+    }
+    if (parts.some((part) => localName(part) === "t")) break;
+  }
+  const props = children(paragraph, "pPr")[0];
+  const run = newRun(doc, mark);
+  if (props?.nextSibling) paragraph.insertBefore(run, props.nextSibling);
+  else if (props) paragraph.appendChild(run);
+  else paragraph.insertBefore(run, paragraph.firstChild);
+}
+
+/** Los bloques del cuerpo como los ve el visor: los controles de contenido y customXml se abren. */
+function bodyBlocks(body: XmlElement): XmlElement[] {
+  const out: XmlElement[] = [];
+  for (const child of children(body)) {
+    const name = localName(child);
+    if (name === "sdt") out.push(...bodyBlocks(children(child, "sdtContent")[0] ?? child));
+    else if (name === "customXml") out.push(...bodyBlocks(child));
+    else if (name === "p" || name === "tbl") out.push(child);
+  }
+  return out;
+}
+
 /** Marca el comienzo de cada sección del cuerpo y devuelve cómo numera cada una (inicio y formato). */
 function markSections(doc: XmlDocument): SectionNumbering[] {
   const body = descendants(doc, "body")[0];
   if (!body) return [];
   const sections: SectionNumbering[] = [];
-  let first: XmlElement | null = null;
+  let opened = false;
   const readNumbering = (sectPr: XmlElement | undefined): SectionNumbering => {
     const pg = sectPr ? children(sectPr, "pgNumType")[0] : undefined;
-    const start = pg?.getAttributeNS(W, "start") || pg?.getAttribute("w:start");
-    const format = pg?.getAttributeNS(W, "fmt") || pg?.getAttribute("w:fmt");
+    const start = attr(pg, "start");
+    const format = attr(pg, "fmt");
     return { start: start ? Number.parseInt(start, 10) : undefined, format: format || undefined };
   };
-  const open = (block: XmlElement) => {
-    const paragraph = localName(block) === "p" ? block : descendants(block, "p")[0];
-    if (!paragraph) return;
-    const props = children(paragraph, "pPr")[0];
-    const run = newRun(doc, sectionMark(sections.length));
-    if (props?.nextSibling) paragraph.insertBefore(run, props.nextSibling);
-    else if (props) paragraph.appendChild(run);
-    else paragraph.insertBefore(run, paragraph.firstChild);
-  };
-  for (const block of children(body)) {
-    const name = localName(block);
-    if (name === "sectPr") continue;
-    if (!first) {
-      first = block;
-      open(block);
+  for (const block of bodyBlocks(body)) {
+    if (!opened) {
+      const paragraph = localName(block) === "p" ? block : descendants(block, "p")[0];
+      if (paragraph) {
+        placeSectionMark(doc, paragraph, sectionMark(sections.length));
+        opened = true;
+      }
     }
-    const sectPr = name === "p" ? children(children(block, "pPr")[0] ?? block, "sectPr")[0] : undefined;
+    const props = localName(block) === "p" ? children(block, "pPr")[0] : undefined;
+    const sectPr = props ? children(props, "sectPr")[0] : undefined;
     if (sectPr) {
       sections.push(readNumbering(sectPr));
-      first = null;
+      opened = false;
     }
   }
-  if (first) sections.push(readNumbering(children(body, "sectPr")[0]));
+  const last = children(body, "sectPr")[0];
+  if (opened || last) sections.push(readNumbering(last));
   return sections;
 }
 
 function parse(xml: string): XmlDocument | null {
-  const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml, "text/xml");
-  return doc.getElementsByTagName("parsererror").length ? null : doc;
+  try {
+    const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml.replace(/^﻿/, ""), "text/xml");
+    return doc.getElementsByTagName("parsererror").length ? null : doc;
+  } catch {
+    return null;
+  }
 }
 
 function serialize(doc: XmlDocument): string {
@@ -181,7 +267,7 @@ function serialize(doc: XmlDocument): string {
   return out.startsWith("<?xml") ? out : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n${out}`;
 }
 
-/** Copia del .docx con marcas en los números de página y en el comienzo de cada sección. */
+/** Copia del .docx con marcas en los números de página, en el comienzo de cada sección y en las llamadas a notas. */
 export async function markPageFields(input: Uint8Array): Promise<MarkedDocx> {
   const zip = await JSZip.loadAsync(input);
   let fields = 0;
@@ -192,9 +278,12 @@ export async function markPageFields(input: Uint8Array): Promise<MarkedDocx> {
   for (const name of parts) {
     const xml = await zip.file(name)?.async("string");
     const doc = xml == null ? null : parse(xml);
-    if (!doc) continue;
+    if (!doc) continue; // si una parte no se puede leer, queda igual que en el Word
     fields += markComplexFields(doc) + markSimpleFields(doc);
-    if (name === "word/document.xml") sections = markSections(doc);
+    if (name === "word/document.xml") {
+      sections = markSections(doc);
+      markFootnoteReferences(doc);
+    }
     zip.file(name, serialize(doc));
   }
   // STORE: es una copia para el visor; las imágenes pasan igual.
