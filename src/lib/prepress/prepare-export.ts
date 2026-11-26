@@ -262,6 +262,20 @@ function lower(text: string, locale?: string): string {
   }
 }
 
+/** Cortador de palabras; con un idioma que no conoce (Word escribe «x-none»), el general en vez de un error. */
+function wordSegmenter(locale?: string): Intl.Segmenter {
+  try {
+    return new Intl.Segmenter(locale || undefined, { granularity: "word" });
+  } catch {
+    return new Intl.Segmenter(undefined, { granularity: "word" });
+  }
+}
+
+/** El número o la viñeta en trozos: el espacio o tabulador de después va aparte, que jsafa no dibuja ni mide. */
+export function markerPieces(text: string): string[] {
+  return splitWords(text);
+}
+
 /**
  * text-transform escrito de verdad. `before` es el texto que viene antes en el mismo párrafo (para saber si una palabra
  * empieza en este nodo o viene del anterior).
@@ -277,8 +291,7 @@ export function transformCase(
   const context = before.slice(-24);
   const whole = context + text;
   let out = "";
-  const segmenter = new Intl.Segmenter(locale || undefined, { granularity: "word" });
-  for (const segment of segmenter.segment(whole)) {
+  for (const segment of wordSegmenter(locale).segment(whole)) {
     const end = segment.index + segment.segment.length;
     if (end <= context.length) continue;
     const piece = segment.index < context.length ? segment.segment.slice(context.length - segment.index) : segment.segment;
@@ -507,6 +520,8 @@ type Ctx = {
   notes: Notes;
   pageIndex: Map<Element, number>;
   autoHyphenation: boolean;
+  /** Los deshacer de cada parte del paso que corre, que el paso todavía no pasó a `undo`. */
+  pending: Undo[];
 };
 
 function pageOf(ctx: Ctx, node: Node | null): number {
@@ -606,13 +621,27 @@ function langOf(el: Element): string | undefined {
   return el.closest("[lang]")?.getAttribute("lang") || undefined;
 }
 
-/** Corre un paso; si falla, avisa y sigue con los demás (lo que alcanzó a hacer igual se deshace al final). */
+/** Un deshacer para una parte del paso (un párrafo, una marca…); si el paso se corta, se deshace igual. */
+function localUndo(ctx: Ctx): Undo {
+  const undo = new Undo();
+  ctx.pending.push(undo);
+  return undo;
+}
+
+/**
+ * Corre un paso; si falla, avisa y sigue con los demás. Lo que ya pasó a `ctx.undo` se deshace al final; lo que quedó
+ * en las partes sin terminar se deshace ahora, para que el paso siguiente no encuentre la página a medio cambiar.
+ */
 function step(ctx: Ctx, fn: () => void) {
+  ctx.pending = [];
   try {
     fn();
   } catch (err) {
     console.warn("pliego: preparación del PDF", err);
     ctx.notes.add("step", 0);
+    for (let i = ctx.pending.length - 1; i >= 0; i -= 1) ctx.pending[i]!.run();
+  } finally {
+    ctx.pending = [];
   }
 }
 
@@ -816,7 +845,7 @@ function prepareMarkers(ctx: Ctx) {
       else if (text === null) ctx.notes.add("marker", pageOf(ctx, el));
       else if (text) {
         const wanted = snapshot(pseudo);
-        jobs.push({ el, kind: "before", text, wanted, host: el, before: { x: 0, y: 0, h: 0 }, undo: new Undo() });
+        jobs.push({ el, kind: "before", text, wanted, host: el, before: { x: 0, y: 0, h: 0 }, undo: localUndo(ctx) });
       }
     }
     if (cs.display !== "list-item") continue;
@@ -842,7 +871,7 @@ function prepareMarkers(ctx: Ctx) {
       wanted,
       host: firstLineHost(el),
       before: { x: 0, y: 0, h: 0 },
-      undo: new Undo(),
+      undo: localUndo(ctx),
     });
   }
   if (jobs.length === 0) return;
@@ -851,7 +880,9 @@ function prepareMarkers(ctx: Ctx) {
   for (const job of jobs) {
     const span = doc.createElement("span");
     span.className = "pliego-x-marca";
-    span.textContent = job.text;
+    // El tabulador que Word pone después del número no puede ir pegado al número: en el PDF sale como cajita o
+    // deforma el número. Va en su propio trozo, que ocupa lo mismo en pantalla y jsafa no dibuja.
+    for (const piece of markerPieces(job.text)) span.append(doc.createTextNode(piece));
     job.undo.insert(span, job.host, job.host.firstChild);
     job.undo.addClass(job.el, job.kind === "before" ? "pliego-x-sin-antes" : "pliego-x-sin-vineta");
     job.span = span;
@@ -917,7 +948,7 @@ function prepareCase(ctx: Ctx) {
   const before = heights(byBlock.keys());
   const undos = new Map<Element, Undo>();
   for (const [block, list] of byBlock) {
-    const undo = new Undo();
+    const undo = localUndo(ctx);
     undos.set(block, undo);
     for (const job of list) {
       const parent = job.node.parentElement;
@@ -1023,7 +1054,7 @@ function prepareHyphens(ctx: Ctx) {
     return broken;
   });
   const jobs = found.map((node, i) => {
-    const undo = new Undo();
+    const undo = localUndo(ctx);
     const { pieces, hyphens } = invisiblePieces(doc, node.data, breaks[i]!);
     undo.replace(node, pieces);
     return { node, undo, hyphens };
@@ -1356,7 +1387,7 @@ function prepareSpacing(ctx: Ctx) {
   const byBlock = new Map<Element, Undo>();
   const undoFor = (node: Node) => {
     const block = blockOf(node) ?? ctx.root;
-    const undo = byBlock.get(block) ?? new Undo();
+    const undo = byBlock.get(block) ?? localUndo(ctx);
     byBlock.set(block, undo);
     return undo;
   };
@@ -1423,6 +1454,7 @@ export function prepareForExport(root: HTMLElement, opts: ExportPrepOptions): ()
     notes: new Notes(),
     pageIndex: new Map(),
     autoHyphenation: opts.autoHyphenation,
+    pending: [],
   };
   const pages = root.matches("section.docx") ? [root] : [...root.querySelectorAll("section.docx")];
   pages.forEach((page, i) => ctx.pageIndex.set(page, i + 1));
