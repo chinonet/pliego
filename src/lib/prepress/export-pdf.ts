@@ -41,6 +41,11 @@ export type ExportOptions = {
    * píxel por píxel (Flate), sin volver a comprimirlo como JPEG. El PDF pesa más.
    */
   jpegToGray?: boolean;
+  /**
+   * Las fotos ya pasadas a gris en una exportación anterior (por ejemplo, la primera de un reintento por una fuente
+   * OTF): no se vuelven a decodificar. Se pasa el mismo Map a las dos llamadas.
+   */
+  grayCache?: GrayCache;
 };
 
 type PdfLib = typeof import("pdf-lib");
@@ -101,7 +106,7 @@ export async function exportPagesToPdf(
     }
   }
 
-  const jpegs = opts.grayscale && opts.jpegToGray ? await jpegsToGray(lib, merged) : null;
+  const jpegs = opts.grayscale && opts.jpegToGray ? await jpegsToGray(lib, merged, decodeJpegRgb, opts.grayCache) : null;
   const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset, overPaint, {
     jpegToGray: Boolean(opts.jpegToGray),
   });
@@ -131,9 +136,9 @@ export type DecodedRgb = { width: number; height: number; rgb: Uint8Array };
 export async function decodeJpegRgb(bytes: Uint8Array): Promise<DecodedRgb | null> {
   const info = readJpeg(bytes);
   if (!info || info.components !== 3 || info.precision !== 8 || !info.width || !info.height) return null;
-  const jpeg = await import("jpeg-js");
-  const decode = jpeg.decode ?? (jpeg as unknown as { default: typeof jpeg }).default.decode;
   try {
+    const jpeg = await import("jpeg-js");
+    const decode = jpeg.decode ?? (jpeg as unknown as { default: typeof jpeg }).default.decode;
     const image = decode(bytes, {
       useTArray: true,
       formatAsRGBA: false,
@@ -155,6 +160,20 @@ export async function decodeJpegRgb(bytes: Uint8Array): Promise<DecodedRgb | nul
 
 export type JpegsToGray = { pages: Set<number>; before: number; after: number };
 
+/** Foto JPEG (por su contenido) → su gris ya comprimido con Flate. */
+export type GrayCache = Map<string, Uint8Array>;
+
+/** Dos FNV-1a de 32 bits con distinta semilla, el tamaño y las medidas: dos fotos distintas no coinciden en la práctica. */
+function jpegKey(bytes: Uint8Array, width: number, height: number): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193 ^ 0x5bd1e995;
+  for (let i = 0; i < bytes.length; i += 1) {
+    a = Math.imul(a ^ bytes[i]!, 0x01000193);
+    b = Math.imul(b ^ bytes[i]!, 0x01000193) ^ (b >>> 15);
+  }
+  return `${width}x${height}:${bytes.length}:${(a >>> 0).toString(16)}:${(b >>> 0).toString(16)}`;
+}
+
 /**
  * Pasa a gris, sin pérdida, cada foto JPEG RGB del PDF (también las que están dentro de un formulario): el gris por
  * luminancia de cada píxel, guardado con Flate. Las que no se pueden leer quedan como estaban (y prepareForPress las
@@ -164,6 +183,7 @@ export async function jpegsToGray(
   lib: PdfLib,
   doc: PDFDocumentType,
   decode: (bytes: Uint8Array) => Promise<DecodedRgb | null> = decodeJpegRgb,
+  cache?: GrayCache,
 ): Promise<JpegsToGray> {
   const context = doc.context;
   const seen = new Set<string>();
@@ -183,13 +203,13 @@ export async function jpegsToGray(
         continue;
       }
       if (subtype !== "Image") continue;
-      const size = await jpegToGray(lib, context, value, decode);
+      const size = await jpegToGray(lib, context, value, decode, cache);
       if (!size) continue;
       result.pages.add(pageNumber);
       result.before += size[0];
       result.after += size[1];
       // Una foto grande tarda: se suelta el hilo para que la pantalla siga respondiendo.
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (!size[2]) await new Promise((resolve) => setTimeout(resolve, 0));
     }
   };
   const pages = doc.getPages();
@@ -197,13 +217,17 @@ export async function jpegsToGray(
   return result;
 }
 
-/** Una foto JPEG RGB → gris sin pérdida. Devuelve [bytes antes, bytes después], o null si no se tocó. */
+/**
+ * Una foto JPEG RGB → gris sin pérdida. Devuelve [bytes antes, bytes después, si salió de `cache`], o null si no se
+ * tocó.
+ */
 async function jpegToGray(
   lib: PdfLib,
   context: PDFContextType,
   ref: PDFRefType,
   decode: (bytes: Uint8Array) => Promise<DecodedRgb | null>,
-): Promise<[number, number] | null> {
+  cache?: GrayCache,
+): Promise<[number, number, boolean] | null> {
   const stream = context.lookup(ref);
   if (!(stream instanceof lib.PDFRawStream)) return null;
   const dict = stream.dict;
@@ -212,16 +236,33 @@ async function jpegToGray(
   if (dict.get(lib.PDFName.of("DecodeParms")) || dict.get(lib.PDFName.of("Decode"))) return null;
   if (nameOf(lib, context, dict.get(lib.PDFName.of("ColorSpace"))) !== "DeviceRGB") return null;
   if (numberOf(lib, context, dict.get(lib.PDFName.of("BitsPerComponent"))) !== 8) return null;
+  // Una máscara de color (/Mask con un rango por cada uno de los 3 canales) o un /Matte de 3 valores en su
+  // transparencia dejarían de valer en gris: esas fotos se dejan como estaban.
+  if (dict.get(lib.PDFName.of("Mask"))) return null;
+  if (asDict(lib, context, dict.get(lib.PDFName.of("SMask")))?.get(lib.PDFName.of("Matte"))) return null;
   const width = numberOf(lib, context, dict.get(lib.PDFName.of("Width")));
   const height = numberOf(lib, context, dict.get(lib.PDFName.of("Height")));
+  if (!width || !height) return null;
+  const before = stream.contents.length;
+  const key = cache ? jpegKey(stream.contents, width, height) : "";
+  const cached = cache?.get(key);
+  if (cached) {
+    const entries: Record<string, PDFObjectType> = {};
+    for (const [name, value] of dict.entries()) {
+      if (!["Filter", "DecodeParms", "Length", "ColorSpace"].includes(name.decodeText())) entries[name.decodeText()] = value;
+    }
+    context.assign(ref, context.stream(cached, { ...entries, ColorSpace: "DeviceGray", Filter: "FlateDecode" }));
+    return [before, cached.length, true];
+  }
   const decoded = await decode(stream.contents);
   if (!decoded || decoded.width !== width || decoded.height !== height) return null;
   if (decoded.rgb.length !== decoded.width * decoded.height * 3) return null;
-  const before = stream.contents.length;
   dict.set(lib.PDFName.of("ColorSpace"), lib.PDFName.of("DeviceGray"));
   replaceStream(lib, context, ref, dict, rgbToGray(decoded.rgb));
   const next = context.lookup(ref);
-  return [before, next instanceof lib.PDFRawStream ? next.contents.length : before];
+  if (!(next instanceof lib.PDFRawStream)) return [before, before, false];
+  cache?.set(key, next.contents);
+  return [before, next.contents.length, false];
 }
 
 /** «340 KB», «2,4 MB», «18 MB». */

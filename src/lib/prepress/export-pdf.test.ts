@@ -217,6 +217,44 @@ const imageDict = (doc: lib.PDFDocument, ref: lib.PDFRef) => {
 }
 
 {
+  // Con el mismo cache, la segunda exportación no decodifica nada y da exactamente el mismo gris.
+  const cache = new Map<string, Uint8Array>();
+  let calls = 0;
+  const counting = async (bytes: Uint8Array) => {
+    calls += 1;
+    return decodeJpegRgb(bytes);
+  };
+  const one = await photoPdf();
+  const firstRun = await jpegsToGray(lib, one.doc, counting, cache);
+  assert.equal(calls, 2);
+  assert.equal(cache.size, 2);
+  const two = await photoPdf();
+  const secondRun = await jpegsToGray(lib, two.doc, counting, cache);
+  assert.equal(calls, 2, "la segunda vez sale del cache");
+  assert.deepEqual([...secondRun.pages], [...firstRun.pages]);
+  assert.equal(secondRun.after, firstRun.after);
+  for (const ref of [two.first, two.second]) {
+    const a = imageDict(one.doc, ref);
+    const b = imageDict(two.doc, ref);
+    assert.deepEqual(lib.decodePDFRawStream(b).decode(), lib.decodePDFRawStream(a).decode());
+    assert.equal(b.dict.get(lib.PDFName.of("ColorSpace"))?.toString(), "/DeviceGray");
+    assert.equal(b.dict.get(lib.PDFName.of("Filter"))?.toString(), "/FlateDecode");
+    assert.equal(b.dict.get(lib.PDFName.of("Width"))?.toString(), a.dict.get(lib.PDFName.of("Width"))?.toString());
+  }
+  const reopened = await lib.PDFDocument.load(await two.doc.save());
+  assert.equal(reopened.getPageCount(), 2);
+}
+
+{
+  // Una máscara de color de 3 canales no vale en gris: esa foto queda como estaba.
+  const { doc, first } = await photoPdf();
+  imageDict(doc, first).dict.set(lib.PDFName.of("Mask"), doc.context.obj([250, 255, 250, 255, 250, 255]));
+  const done = await jpegsToGray(lib, doc);
+  assert.deepEqual([...done.pages], [2]);
+  assert.equal(imageDict(doc, first).dict.get(lib.PDFName.of("ColorSpace"))?.toString(), "/DeviceRGB");
+}
+
+{
   // Sin la opción, la foto JPEG en color queda igual y la app sugiere encenderla.
   const { doc, first } = await photoPdf();
   const original = imageDict(doc, first).contents;

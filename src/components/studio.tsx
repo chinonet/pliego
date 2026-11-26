@@ -570,7 +570,17 @@ export function Studio() {
         unlock();
       };
       await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current), embeddedRef.current);
-      const base = { title: stem(nameRef.current), cropMarks, grayscale, jpegToGray: grayscale && jpegToGray, bleed, flatten: true };
+      // Si hay que rehacer el PDF (fuente OTF), las fotos ya pasadas a gris no se vuelven a decodificar.
+      const grayCache = new Map<string, Uint8Array>();
+      const base = {
+        title: stem(nameRef.current),
+        cropMarks,
+        grayscale,
+        jpegToGray: grayscale && jpegToGray,
+        grayCache,
+        bleed,
+        flatten: true,
+      };
       let result: Awaited<ReturnType<typeof exportPagesToPdf>>;
       try {
         result = await exportPagesToPdf(sections, { ...base, subset: !fullFont });
