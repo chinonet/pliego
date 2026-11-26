@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import JSZip from "jszip";
-import { auditDocx, cropFromTransform, iccInfo, imageLevels, readJpeg, readPng, sniffImage } from "./image-audit.ts";
+import {
+  auditDocx,
+  cropFromTransform,
+  iccInfo,
+  imageLevels,
+  mergeRepeated,
+  pagesLabel,
+  readJpeg,
+  readPng,
+  type RenderedImage,
+  sniffImage,
+} from "./image-audit.ts";
 import {
   deobfuscateFont,
   embeddedFamilies,
@@ -10,6 +21,9 @@ import {
   faceKey,
   missingFacesFrom,
   SUBSTITUTE_FACES,
+  subsetFallbacks,
+  substituteAlias,
+  withSubstituteAlias,
 } from "./substitutes.ts";
 
 const enc = new TextEncoder();
@@ -244,7 +258,33 @@ assert.equal(embedded.faces[0]!.restricted, false);
 assert.equal(embedded.warnings.length, 1);
 assert.match(embedded.warnings[0]!, /«Calibri» \(cursiva\) no se pudo leer/);
 const skips = embeddedSkips(embedded.faces);
-assert.ok(skips.has(faceKey("Calibri", 400, "normal")), "la sustituta normal de Calibri se salta");
+assert.ok(!skips.has(faceKey("Calibri", 400, "normal")), "la cara del Word está recortada: la sustituta queda detrás");
 assert.ok(!skips.has(faceKey("Calibri", 700, "normal")), "la negrita sustituta sigue");
+const whole = embeddedSkips([{ ...embedded.faces[0]!, subsetted: false }]);
+assert.ok(whole.has(faceKey("Calibri", 400, "normal")), "con la cara entera del Word, la sustituta se salta");
+assert.deepEqual([...subsetFallbacks(embedded.faces)], [faceKey("Calibri", 400, "normal")]);
+assert.equal(subsetFallbacks([{ family: "Garamond Rara", weight: 400, style: "normal", subsetted: true }]).size, 0, "sin sustituta, nada");
+assert.equal(substituteAlias("Calibri"), "Calibri (sustituta)");
+assert.equal(withSubstituteAlias('Calibri, serif', "Calibri (sustituta)"), 'Calibri, "Calibri (sustituta)", serif');
+assert.equal(withSubstituteAlias('"Calibri"', "Calibri (sustituta)"), '"Calibri", "Calibri (sustituta)"');
+assert.equal(withSubstituteAlias('Calibri, "calibri (sustituta)"', "Calibri (sustituta)"), 'Calibri, "calibri (sustituta)"', "ya estaba");
+
+// La misma imagen del encabezado en cada página: una sola entrada, con la lista de páginas.
+const shot = (page: number, label = "Logo"): RenderedImage => ({ label, page, pixels: "600×200", ppi: 300, level: "ok", note: "sin recomprimir" });
+const merged = mergeRepeated([
+  { key: "logo", image: shot(1) },
+  { key: "foto", image: shot(2, "Foto") },
+  { key: "logo", image: shot(2) },
+  { key: "logo", image: shot(3) },
+  { key: "", image: shot(3, "Rota") },
+  { key: "", image: shot(4, "Rota") },
+]);
+assert.deepEqual(merged.map((image) => [image.label, image.page]), [["Logo", 1], ["Foto", 2], ["Rota", 3], ["Rota", 4]]);
+assert.deepEqual(merged[0]!.pages, [1, 2, 3]);
+assert.equal(merged[0]!.note, "sin recomprimir · se repite en las páginas 1, 2 y 3");
+assert.equal(merged[1]!.pages, undefined);
+assert.equal(pagesLabel([7]), "7");
+assert.equal(pagesLabel([8, 3]), "3 y 8");
+assert.equal(pagesLabel(Array.from({ length: 300 }, (_, i) => i + 1)), "de la 1 a la 300 (300 páginas)");
 
 console.log("image-audit ok", warnings.length, "avisos");
