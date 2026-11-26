@@ -59,6 +59,18 @@
    nada) y con alto fijo el texto que sobra se va a columnas fuera de la hoja sin que la repaginación lo vea. El llenado
    en orden, como Word, lo hace la composición después de repaginar y solo donde entra todo. */
 
+/* Imágenes del Word: el visor las pone en una caja del tamaño de la imagen, pero la imagen va alineada al medio del
+   renglón y la caja termina más alta que en Word (unos 2 pt por imagen, que desbordan páginas). Como en Word: la imagen
+   llena su caja, la caja se apoya en la línea base y recorta lo que sobra de una imagen recortada. */
+.pliego-stage section.docx div[style*="inline-block"]:has(> img) {
+  overflow: hidden;
+  vertical-align: baseline;
+}
+
+.pliego-stage section.docx div[style*="inline-block"] > img {
+  display: block;
+}
+
 /* Segunda parte de un párrafo que se partió entre dos páginas: no repite el número o la viñeta de lista ni cuenta
    otra vez en la numeración. */
 .pliego-stage section.docx .pliego-sigue {
