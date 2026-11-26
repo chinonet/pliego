@@ -14,6 +14,7 @@ import { cleanDocx, type CleanOptions, type CleanReport } from "@/lib/prepress/c
 import { fontKey } from "@/lib/prepress/font-face";
 import { forgetFace, installFontFaces, loadShelf, readFontFile, rememberFace, registerShelfFonts, type ShelfFace } from "@/lib/prepress/font-shelf";
 import {
+  addSubstituteFallback,
   embeddedFonts,
   embeddedSkips,
   faceKey,
@@ -21,13 +22,14 @@ import {
   loadSubstituteFaces,
   missingFaces,
   SUBSTITUTE_FACES,
+  subsetFallbacks,
   type EmbeddedFace,
   type MissingFace,
 } from "@/lib/prepress/substitutes";
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
 import { fixDefaultStyleSelectors } from "@/lib/prepress/docx-css";
-import { applyLayout, numberFootnotes, numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
+import { applyLayout, mergeContinuous, numberFootnotes, numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
 import { DEFAULT_RENDER_INFO, prepareRenderCopy, type RenderInfo } from "@/lib/prepress/render-copy";
 import { fixCroppedImages, prepareForExport } from "@/lib/prepress/prepare-export";
 import { auditDocx, auditRenderedImages, type RenderedImage } from "@/lib/prepress/image-audit";
@@ -107,6 +109,8 @@ export function Studio() {
   // Mientras se compone, la vista queda a tamaño real (el visor mide tabulaciones y renglones en pantalla).
   const composingRef = useRef(false);
   const exportingRef = useRef(false);
+  // Caras recortadas del Word que la sustituta completa con las letras que les faltan.
+  const fallbackRef = useRef<Set<string>>(new Set());
   const [exporting, setExporting] = useState(false);
 
   const [name, setName] = useState("");
@@ -203,10 +207,12 @@ export function Studio() {
     // Si el Word trae su propia fuente incrustada, va esa; la sustituta solo completa las caras que falten.
     const usable = embeddedRef.current.filter((face) => !face.restricted);
     const skip = embeddedSkips(usable);
-    installSubstitutes(substitutesRef.current, skip);
+    const fallback = subsetFallbacks(usable);
+    fallbackRef.current = fallback;
+    installSubstitutes(substitutesRef.current, skip, fallback);
     const aliases = fontAliases(shelfRef.current, reportRef.current);
     installFontFaces(shelfRef.current, aliases);
-    if (substitutesRef.current) await loadSubstituteFaces(skip);
+    if (substitutesRef.current) await loadSubstituteFaces(skip, fallback);
     if ("fonts" in document) {
       const families = new Set<string>(aliases.map((item) => item.family));
       for (const face of shelfRef.current) families.add(face.family);
@@ -276,7 +282,7 @@ export function Studio() {
       const tag = document.getElementById(id);
       if (tag) document.head.appendChild(tag);
     }
-    if (substitutesRef.current) await loadSubstituteFaces(skip);
+    if (substitutesRef.current) await loadSubstituteFaces(skip, fallback);
     if ("fonts" in document && covered.size > 0) {
       await Promise.all(
         [...covered].map((family) => document.fonts.load(`16px "${family}"`).catch(() => undefined)),
@@ -319,16 +325,15 @@ export function Studio() {
       if (!paragraph.textContent?.trim() && paragraph.querySelector("img, svg")) paragraph.style.lineHeight = "normal";
     }
     const map = takeMarks(body);
-    repaginate(body, map);
+    mergeContinuous(body, map, prepared.info);
+    repaginate(body, map, prepared.info);
     const layout = applyLayout(body, map, prepared.info, marked.sections);
     numberFootnotes(body, prepared.info, map);
     numberPages(body, marked.sections, map);
-    fillLastColumns(body, (_article, page) => {
-      // La última página de una sección seguida de un salto continuo queda equilibrada, como en Word.
-      const section = map.section.get(page) ?? 0;
-      const next = page.nextElementSibling as HTMLElement | null;
-      const nextSection = next ? map.section.get(next) : undefined;
-      return nextSection !== section && prepared.info.sections[section + 1]?.type === "continuous";
+    fillLastColumns(body, (article) => {
+      // El final de una sección seguida de un salto continuo queda equilibrado, como en Word.
+      const section = Number.parseInt(article.dataset.pliegoSection ?? "", 10);
+      return Number.isFinite(section) && prepared.info.sections[section + 1]?.type === "continuous";
     });
     fixCroppedImages(body);
     setTooTall(layout.tooTall);
@@ -527,7 +532,13 @@ export function Studio() {
     try {
       // Lo que el PDF no ve (números de lista, versalitas, subrayados, guiones de corte…) pasa a texto y cajas.
       const notes: string[] = [];
-      restore = prepareForExport(doc, { autoHyphenation: renderInfoRef.current.autoHyphenation, warnings: notes });
+      const undoPrep = prepareForExport(doc, { autoHyphenation: renderInfoRef.current.autoHyphenation, warnings: notes });
+      // Para las letras que le faltan a una fuente recortada del Word, el PDF usa la sustituta.
+      const undoFallback = substitutesRef.current ? addSubstituteFallback(doc, fallbackRef.current) : () => {};
+      restore = () => {
+        undoFallback();
+        undoPrep();
+      };
       const sections = [...doc.querySelectorAll("section.docx")] as HTMLElement[];
       // Cada hoja sale con el alto exacto del corte: lo que sobresale un píxel (un margen final) no agranda la página.
       const locked = sections.map((section) => ({ section, height: section.style.height, overflow: section.style.overflow }));
@@ -567,7 +578,7 @@ export function Studio() {
           setError("No se pudo rehacer el PDF con la fuente OpenType recortada: se guardó con la fuente entera, que no cumple PDF/X.");
         }
       }
-      setPress({ pdfx: result.pdfx, problems: result.problems, notes });
+      setPress({ pdfx: result.pdfx, problems: result.problems, notes: [...notes, ...result.notes] });
       saveBytes(result.bytes, `${stem(nameRef.current)}.pdf`, "application/pdf");
       setStatus("");
     } catch (err) {

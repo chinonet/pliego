@@ -13,8 +13,8 @@
  * de carácter, igual que en Word.
  */
 export function fixDefaultStyleSelectors(css: string, className = "docx"): string {
-  const escaped = className.replace(/[.*+?^${}()|[\]\]/g, "\$&");
-  const pattern = new RegExp(`\.${escaped} ([a-z0-9]+), \1\.([\w-]+) ([a-z0-9]+)(\s*\{)`, "gi");
+  const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\.${escaped} ([a-z0-9]+), \\1\\.([\\w-]+) ([a-z0-9]+)(\\s*\\{)`, "gi");
   return css.replace(pattern, (_all, target: string, name: string, sub: string, open: string) =>
     `.${className} :where(${target}:not([class*="${className}_"]), ${target}.${name}) ${sub}${open}`,
   );
