@@ -320,9 +320,13 @@ export function Studio() {
     for (const face of usable) metrics.addBytes(face.family, face.bytes, face);
     if (substitutesRef.current) for (const face of SUBSTITUTE_FACES) metrics.addUrl(face.family, face.file, face);
     const spacing = await fixLineSpacing(body, { metrics: metrics.metrics, spacing: prepared.info.spacing, className: "docx" });
-    // Un renglón que solo tiene una imagen: Word no suma interlineado debajo de la imagen.
+    // Un renglón que solo tiene una imagen: Word lo hace del alto de la imagen más el descendente de la letra de ese
+    // renglón (el interlineado extra no se suma debajo de la imagen).
     for (const paragraph of body.querySelectorAll<HTMLElement>("section.docx p")) {
-      if (!paragraph.textContent?.trim() && paragraph.querySelector("img, svg")) paragraph.style.lineHeight = "normal";
+      if (paragraph.textContent?.trim() || !paragraph.querySelector("img, svg")) continue;
+      const size = Number.parseFloat(getComputedStyle(paragraph.querySelector("span") ?? paragraph).fontSize) || 16;
+      paragraph.style.lineHeight = "0";
+      paragraph.style.paddingBottom = `${(size * 0.222).toFixed(2)}px`;
     }
     const map = takeMarks(body);
     mergeContinuous(body, map, prepared.info);
