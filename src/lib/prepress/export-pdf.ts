@@ -64,7 +64,7 @@ export async function exportPagesToPdf(
   else merged.context.header = lib.PDFHeader.forVersion(1, 4);
   const id = lib.PDFHexString.of(fileId(opts.title));
   merged.context.trailerInfo.ID = merged.context.obj([id, id]);
-  merged.getInfoDict().set(lib.PDFName.of("Trapped"), lib.PDFName.of("False"));
+  infoDict(lib, merged).set(lib.PDFName.of("Trapped"), lib.PDFName.of("False"));
 
   const bytes = await merged.save({ useObjectStreams: false });
   return { bytes, pdfx, problems };
@@ -318,10 +318,19 @@ function declarePdfX1a(lib: PdfLib, doc: PDFDocumentType, title: string) {
     Info: lib.PDFString.of("U.S. Web Coated (SWOP) v2"),
   });
   doc.catalog.set(lib.PDFName.of("OutputIntents"), context.obj([intent]));
-  const info = doc.getInfoDict();
+  const info = infoDict(lib, doc);
   info.set(lib.PDFName.of("GTS_PDFXVersion"), lib.PDFString.of("PDF/X-1a:2001"));
   info.set(lib.PDFName.of("GTS_PDFXConformance"), lib.PDFString.of("PDF/X-1a:2001"));
   info.set(lib.PDFName.of("Title"), lib.PDFHexString.fromText(title));
+}
+
+/** El diccionario Info del archivo (título, fechas, datos PDF/X). */
+function infoDict(lib: PdfLib, doc: PDFDocumentType): PDFDictType {
+  const info = asDict(lib, doc.context, doc.context.trailerInfo.Info);
+  if (info) return info;
+  const fresh = doc.context.obj({});
+  doc.context.trailerInfo.Info = doc.context.register(fresh);
+  return fresh;
 }
 
 /** Identificador del archivo (PDF/X lo exige): 16 bytes en hexadecimal. */
