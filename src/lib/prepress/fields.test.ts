@@ -25,7 +25,7 @@ const footerXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:r><w:t xml:space="preserve"> de </w:t></w:r>
 <w:fldSimple w:instr=" NUMPAGES "><w:r><w:t>9</w:t></w:r></w:fldSimple>
 <w:fldSimple w:instr=" SECTIONPAGES "><w:r><w:t>4</w:t></w:r></w:fldSimple>
-<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE \* roman </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>ii</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
+<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE \\* roman </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>ii</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
 <w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
 </w:p></w:ftr>`;
 

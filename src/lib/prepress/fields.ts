@@ -255,7 +255,7 @@ function markSections(doc: XmlDocument): SectionNumbering[] {
 
 function parse(xml: string): XmlDocument | null {
   try {
-    const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml.replace(/^﻿/, ""), "text/xml");
+    const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml.replace(/^\uFEFF/, ""), "text/xml");
     return doc.getElementsByTagName("parsererror").length ? null : doc;
   } catch {
     return null;
