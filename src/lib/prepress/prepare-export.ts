@@ -967,6 +967,8 @@ function prepareCase(ctx: Ctx) {
           span.className = "pliego-x-versalita";
           // El navegador arma las versalitas que la letra no trae con mayúsculas al 70 %.
           span.style.fontSize = "0.7em";
+          // Sin interlineado propio: con la letra más chica y el mismo alto fijo, el renglón crecía y se deshacía todo.
+          span.style.lineHeight = "0";
           span.textContent = piece.text;
           return span;
         });
