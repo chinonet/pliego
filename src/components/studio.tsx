@@ -106,6 +106,8 @@ export function Studio() {
   const renderInfoRef = useRef<RenderInfo>(DEFAULT_RENDER_INFO);
   // Mientras se compone, la vista queda a tamaño real (el visor mide tabulaciones y renglones en pantalla).
   const composingRef = useRef(false);
+  const exportingRef = useRef(false);
+  const [exporting, setExporting] = useState(false);
 
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<"idle" | "working" | "ready" | "error">("idle");
@@ -508,7 +510,10 @@ export function Studio() {
 
   async function downloadPdf() {
     const doc = docRef.current;
-    if (!doc || phase !== "ready") return;
+    if (!doc || phase !== "ready" || exportingRef.current) return;
+    // Una sola exportación a la vez: la segunda prepararía una página ya preparada.
+    exportingRef.current = true;
+    setExporting(true);
     setStatus("Incrustando fuentes y pasando las imágenes tal cual");
     const previousFit = fit;
     flushSync(() => {
@@ -524,6 +529,23 @@ export function Studio() {
       const notes: string[] = [];
       restore = prepareForExport(doc, { autoHyphenation: renderInfoRef.current.autoHyphenation, warnings: notes });
       const sections = [...doc.querySelectorAll("section.docx")] as HTMLElement[];
+      // Cada hoja sale con el alto exacto del corte: lo que sobresale un píxel (un margen final) no agranda la página.
+      const locked = sections.map((section) => ({ section, height: section.style.height, overflow: section.style.overflow }));
+      for (const section of sections) {
+        const sheet = getComputedStyle(section).minHeight;
+        if (sheet && sheet !== "0px") {
+          section.style.height = sheet;
+          section.style.overflow = "hidden";
+        }
+      }
+      const unlock = restore;
+      restore = () => {
+        for (const item of locked) {
+          item.section.style.height = item.height;
+          item.section.style.overflow = item.overflow;
+        }
+        unlock();
+      };
       await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current), embeddedRef.current);
       const base = { title: stem(nameRef.current), cropMarks, grayscale, bleed, flatten: true };
       let result: Awaited<ReturnType<typeof exportPagesToPdf>>;
@@ -536,9 +558,14 @@ export function Studio() {
         setError("Esa fuente no permite incrustarse entera. Se incrustó el subconjunto usado.");
       }
       if (result.needsSubset) {
-        result = await exportPagesToPdf(sections, { ...base, subset: true });
-        setFullFont(false);
-        setError("Una fuente OpenType (OTF) no puede ir entera en PDF/X: se incrustó solo lo que usa el libro.");
+        // Si el reintento falla, se guarda el primer PDF (con el aviso de la fuente entera).
+        try {
+          result = await exportPagesToPdf(sections, { ...base, subset: true });
+          setFullFont(false);
+          setError("Una fuente OpenType (OTF) no puede ir entera en PDF/X: se incrustó solo lo que usa el libro.");
+        } catch {
+          setError("No se pudo rehacer el PDF con la fuente OpenType recortada: se guardó con la fuente entera, que no cumple PDF/X.");
+        }
       }
       setPress({ pdfx: result.pdfx, problems: result.problems, notes });
       saveBytes(result.bytes, `${stem(nameRef.current)}.pdf`, "application/pdf");
@@ -553,13 +580,15 @@ export function Studio() {
     } finally {
       restore();
       doc.classList.remove("pliego-exporting");
+      exportingRef.current = false;
+      setExporting(false);
       flushSync(() => setFit(previousFit));
       requestAnimationFrame(measure);
     }
   }
 
   const imageBytes = report?.images.reduce((sum, image) => sum + image.bytes, 0) ?? 0;
-  const busy = phase === "working";
+  const busy = phase === "working" || exporting;
 
   return (
     <main className="flex min-h-screen flex-col bg-bg pb-28 text-fg">
