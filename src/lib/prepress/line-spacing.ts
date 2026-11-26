@@ -777,7 +777,13 @@ export async function fixLineSpacing(
       if (approximate.has(face.family)) usedApproximate.add(face.family);
       return wordLinePx(rule, ratio, face.size);
     };
-    const line = lineFor(read.base);
+    // Word mide cada renglón con la letra de su texto (la mayor de la línea); la del párrafo solo cuenta si no hay
+    // texto. Por eso el mínimo del párrafo es el renglón más bajo entre sus letras, y cada tramo lleva el suyo.
+    const textLines = read.spans
+      .filter((span) => span.el.textContent?.trim())
+      .map((span) => lineFor(span.face))
+      .filter((value): value is number => value !== null);
+    const line = textLines.length ? Math.min(...textLines) : lineFor(read.base);
     if (line === null) continue;
     p.style.lineHeight = round(line);
     p.style.minHeight = round(line);
@@ -785,7 +791,7 @@ export async function fixLineSpacing(
     // Cada tramo con otra letra u otro tamaño lleva su propio renglón (Word usa el mayor de la línea).
     const assigned = new Map<HTMLElement, string>();
     for (const span of read.spans) {
-      let parentKey = faceKey(read.base);
+      let parentKey = "";
       for (let up = span.el.parentElement; up && up !== p; up = up.parentElement) {
         const key = assigned.get(up);
         if (key) {
