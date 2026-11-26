@@ -1,7 +1,12 @@
 import { FOOTNOTE_MARK, MARK_CLOSE, MARK_OPEN, PAGES_MARK, SECTION_PAGES_MARK, type SectionNumbering } from "./fields.ts";
+import { DEFAULT_RENDER_INFO, type RenderInfo, type SectionLayout } from "./render-copy.ts";
 
 const PAGE_SELECTOR = "section.docx";
 const NOTE_REF = "sup[data-pliego-note]";
+/** Nota con marca propia (w:customMarkFollows): la llamada no lleva número, el símbolo ya está en el texto. */
+export const CUSTOM_NOTE_MARK = `${MARK_OPEN}C${MARK_CLOSE}`;
+/** Puntos a píxeles CSS. */
+const PT = 96 / 72;
 
 function pagesOf(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll(PAGE_SELECTOR)] as HTMLElement[];
@@ -35,6 +40,11 @@ function notesList(page: HTMLElement): HTMLElement | null {
   return childrenOf(page, "ol")[0] ?? null;
 }
 
+/** Página en blanco que se agregó para que una sección empiece en página impar o par. */
+function isBlank(page: HTMLElement): boolean {
+  return page.dataset.pliegoBlank !== undefined;
+}
+
 export type PageMap = {
   /** Sección de cada página. */
   section: Map<HTMLElement, number>;
@@ -43,6 +53,14 @@ export type PageMap = {
   /** Encabezado y pie del Word para cada sección, según la página sea impar (0) o par (1). */
   templates: Map<number, Array<{ header: HTMLElement | null; footer: HTMLElement | null } | undefined>>;
 };
+
+/** La llamada a nota que sigue a una marca: se saltean los textos que son solo marcas (o quedaron vacíos). */
+function supAfter(node: Text): HTMLElement | null {
+  const onlyMarks = new RegExp(`^(?:${MARK_OPEN}[^${MARK_CLOSE}]*${MARK_CLOSE})*$`);
+  let next = node.nextSibling;
+  while (next && next.nodeType === Node.TEXT_NODE && onlyMarks.test(next.nodeValue ?? "")) next = next.nextSibling;
+  return next instanceof HTMLElement && next.tagName === "SUP" ? next : null;
+}
 
 /**
  * Quita del texto las marcas de sección y de notas al pie, y anota de qué sección es cada página y qué encabezado y pie
@@ -54,20 +72,27 @@ export function takeMarks(root: HTMLElement): PageMap {
   const first = new Set<HTMLElement>();
   const starts = new Map<HTMLElement, number>();
   const pattern = new RegExp(`${MARK_OPEN}S(\\d+)${MARK_CLOSE}`, "g");
-  for (const node of markTexts(root)) {
+  const nodes = markTexts(root);
+  // Primero se buscan las llamadas (con las marcas todavía puestas) y después se limpia el texto.
+  for (const node of nodes) {
+    const text = node.nodeValue ?? "";
+    if (!text.includes(FOOTNOTE_MARK) && !text.includes(CUSTOM_NOTE_MARK)) continue;
+    const sup = supAfter(node);
+    if (!sup) continue;
+    if (text.includes(FOOTNOTE_MARK)) sup.dataset.pliegoNote = "";
+    if (text.includes(CUSTOM_NOTE_MARK)) sup.dataset.pliegoCustom = "";
+  }
+  for (const node of nodes) {
     let text = node.nodeValue ?? "";
     for (const match of text.matchAll(pattern)) {
       const page = pages.find((item) => item.contains(node));
       if (page && !starts.has(page)) starts.set(page, Number(match[1]));
     }
-    text = text.replace(pattern, "");
-    if (text.includes(FOOTNOTE_MARK)) {
-      const sup = node.nextSibling;
-      if (sup instanceof HTMLElement && sup.tagName === "SUP") sup.dataset.pliegoNote = "";
-      text = text.split(FOOTNOTE_MARK).join("");
-    }
+    text = text.replace(pattern, "").split(FOOTNOTE_MARK).join("").split(CUSTOM_NOTE_MARK).join("");
     node.nodeValue = text;
   }
+  // Una marca de nota propia sin su marca de nota común igual es una llamada (por si llegan en textos separados).
+  for (const sup of root.querySelectorAll("sup[data-pliego-custom]")) (sup as HTMLElement).dataset.pliegoNote = "";
   const templates: PageMap["templates"] = new Map();
   let current = 0;
   pages.forEach((page, index) => {
@@ -97,13 +122,12 @@ function swap(page: HTMLElement, tag: "header" | "footer", model: HTMLElement | 
 }
 
 /**
- * Lo que no entra en la hoja pasa a una página nueva, igual que haría Word: se mueven párrafos o tablas enteros desde
- * el final, con sus notas al pie. Después cada página lleva el encabezado y el pie que le tocan por sección y por
- * página par o impar. Devuelve las páginas que siguen sin entrar (un solo bloque más alto que la hoja).
+ * Pasa a páginas nuevas lo que no entra en la hoja, igual que haría Word: se mueven párrafos o tablas enteros desde
+ * el final, con sus notas al pie. Se puede llamar otra vez (después de cambiar márgenes): solo toca las páginas que
+ * no entran. Devuelve cuántas páginas agregó y anota las que siguen sin entrar (un solo bloque más alto que la hoja).
  */
-export function repaginate(root: HTMLElement, map: PageMap): { added: number; tooTall: number[] } {
+function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): number {
   let added = 0;
-  const tooTall = new Set<HTMLElement>();
   let page = root.querySelector(PAGE_SELECTOR) as HTMLElement | null;
   while (page) {
     const current = page;
@@ -111,6 +135,7 @@ export function repaginate(root: HTMLElement, map: PageMap): { added: number; to
     const blocks = () => childrenOf(current, "article").reduce((sum, article) => sum + article.children.length, 0);
     if (overflows(current, height) && blocks() > 1) {
       const fresh = current.cloneNode(false) as HTMLElement;
+      delete fresh.dataset.pliegoBlank;
       const header = childrenOf(current, "header")[0];
       const footer = childrenOf(current, "footer")[0];
       if (header) fresh.appendChild(header.cloneNode(true));
@@ -148,28 +173,315 @@ export function repaginate(root: HTMLElement, map: PageMap): { added: number; to
       }
     }
     if (overflows(current, height)) tooTall.add(current);
+    else tooTall.delete(current);
     const following = current.nextElementSibling as HTMLElement | null;
     page = following?.matches(PAGE_SELECTOR) ? following : null;
   }
+  return added;
+}
 
+/** Cada página lleva el encabezado y el pie que le tocan por sección y por página par o impar. */
+function dress(root: HTMLElement, map: PageMap) {
+  pagesOf(root).forEach((item, index) => {
+    if (map.first.has(item)) return;
+    const slots = map.templates.get(map.section.get(item) ?? 0);
+    const model = slots?.[index % 2] ?? slots?.[(index + 1) % 2];
+    if (!model) return;
+    swap(item, "header", model.header);
+    swap(item, "footer", model.footer);
+  });
+}
+
+function pageNumbers(root: HTMLElement, set: Set<HTMLElement>): number[] {
   const pages = pagesOf(root);
-  if (added) {
-    pages.forEach((item, index) => {
-      if (map.first.has(item)) return;
-      const slots = map.templates.get(map.section.get(item) ?? 0);
-      const model = slots?.[index % 2] ?? slots?.[(index + 1) % 2];
-      if (!model) return;
-      swap(item, "header", model.header);
-      swap(item, "footer", model.footer);
-    });
+  return [...set].map((item) => pages.indexOf(item) + 1).filter((n) => n > 0).sort((a, b) => a - b);
+}
+
+/**
+ * Lo que no entra en la hoja pasa a una página nueva, igual que haría Word: se mueven párrafos o tablas enteros desde
+ * el final, con sus notas al pie. Después cada página lleva el encabezado y el pie que le tocan por sección y por
+ * página par o impar. Devuelve las páginas que siguen sin entrar (un solo bloque más alto que la hoja).
+ */
+export function repaginate(root: HTMLElement, map: PageMap): { added: number; tooTall: number[] } {
+  const tooTall = new Set<HTMLElement>();
+  const added = flow(root, map, tooTall);
+  if (added) dress(root, map);
+  // Numeración común de Word (seguida desde 1); numberFootnotes la rehace con la del documento.
+  numberFootnotes(root, DEFAULT_RENDER_INFO, map);
+  return { added, tooTall: pageNumbers(root, tooTall) };
+}
+
+/* ---------- Diseño de página que el visor no aplica: márgenes simétricos, encuadernación, secciones impar/par ---------- */
+
+export type Padding = { left: number; right: number; top: number };
+
+/**
+ * Márgenes de una página (en píxeles) a partir de los del Word. Con márgenes simétricos el izquierdo del Word es el
+ * interior: en las páginas pares (índice 1, 3…) pasa a la derecha. La encuadernación se suma al margen interior; sin
+ * márgenes simétricos va siempre a la izquierda, o arriba si el Word lo pide.
+ */
+export function layoutPadding(
+  base: Padding,
+  index: number,
+  gutterPt: number,
+  mirrorMargins: boolean,
+  gutterAtTop: boolean,
+): Padding {
+  const even = index % 2 === 1;
+  const gutter = Math.max(0, gutterPt) * PT;
+  let { left, right, top } = base;
+  if (mirrorMargins && even) [left, right] = [right, left];
+  if (gutter > 0) {
+    if (mirrorMargins) {
+      if (even) right += gutter;
+      else left += gutter;
+    } else if (gutterAtTop) top += gutter;
+    else left += gutter;
   }
-  // Las llamadas a nota se numeran por página, como las numera el visor.
-  for (const item of pages) {
-    [...item.querySelectorAll(NOTE_REF)].forEach((sup, index) => {
-      sup.textContent = String(index + 1);
-    });
+  return { left, right, top };
+}
+
+/** Los márgenes que puso el visor, guardados la primera vez (las páginas nuevas los heredan al copiarse). */
+function basePadding(page: HTMLElement): Padding {
+  const saved = page.dataset.pliegoPad?.split(" ").map(Number);
+  if (saved && saved.length === 3 && saved.every(Number.isFinite)) {
+    return { left: saved[0]!, right: saved[1]!, top: saved[2]! };
   }
-  return { added, tooTall: [...tooTall].map((item) => pages.indexOf(item) + 1).filter((n) => n > 0) };
+  const style = getComputedStyle(page);
+  const pad = {
+    left: Number.parseFloat(style.paddingLeft) || 0,
+    right: Number.parseFloat(style.paddingRight) || 0,
+    top: Number.parseFloat(style.paddingTop) || 0,
+  };
+  page.dataset.pliegoPad = `${pad.left} ${pad.right} ${pad.top}`;
+  return pad;
+}
+
+function setMargins(root: HTMLElement, map: PageMap, info: RenderInfo) {
+  const pages = pagesOf(root);
+  // Se leen todos antes de escribir, para no medir a mitad de cambio.
+  const bases = pages.map(basePadding);
+  pages.forEach((page, index) => {
+    const layout = info.sections[map.section.get(page) ?? 0];
+    const pad = layoutPadding(bases[index]!, index, layout?.gutterPt ?? 0, info.mirrorMargins, info.gutterAtTop);
+    page.style.paddingLeft = `${pad.left}px`;
+    page.style.paddingRight = `${pad.right}px`;
+    page.style.paddingTop = `${pad.top}px`;
+  });
+}
+
+export type PlanPage = { section: number; first: boolean };
+
+/** 1 = tiene que empezar en página impar, 0 = en par, null = donde caiga. */
+function wantedParity(layout: SectionLayout | undefined): 0 | 1 | null {
+  if (layout?.type === "oddPage") return 1;
+  if (layout?.type === "evenPage") return 0;
+  return null;
+}
+
+/**
+ * Antes de qué páginas (índices) va una página en blanco para que cada sección «página impar» o «página par» empiece
+ * con un número de esa paridad. Los números se cuentan como numberPages; como Word, se mira el número de la página
+ * (si la sección vuelve a empezar en 2 y pide impar, igual lleva la página en blanco).
+ */
+export function planBlanks(pages: PlanPage[], numbering: SectionNumbering[], layouts: SectionLayout[]): number[] {
+  const out: number[] = [];
+  let current = 0;
+  let previous: number | null = null;
+  pages.forEach((page, index) => {
+    if (index === 0 || (page.first && page.section !== previous)) {
+      const start = numbering[page.section]?.start;
+      let n = start !== undefined ? start : current + 1;
+      const parity = wantedParity(layouts[page.section]);
+      if (index > 0 && parity !== null && n % 2 !== parity) {
+        out.push(index);
+        // La página en blanco se lleva el número siguiente de la sección anterior.
+        if (start === undefined) n += 1;
+      }
+      current = n;
+    } else {
+      current += 1;
+    }
+    previous = page.section;
+  });
+  return out;
+}
+
+/** Secciones «impar»/«par» que en el PDF (página 1 = derecha) quedan del otro lado. */
+export function wrongSide(pages: PlanPage[], layouts: SectionLayout[]): Array<{ section: number; page: number }> {
+  const out: Array<{ section: number; page: number }> = [];
+  let previous: number | null = null;
+  pages.forEach((page, index) => {
+    if (index > 0 && page.first && page.section !== previous) {
+      const parity = wantedParity(layouts[page.section]);
+      if (parity !== null && (index + 1) % 2 !== parity) out.push({ section: page.section, page: index + 1 });
+    }
+    previous = page.section;
+  });
+  return out;
+}
+
+function planOf(root: HTMLElement, map: PageMap, withBlanks: boolean): { pages: HTMLElement[]; plan: PlanPage[] } {
+  const pages = pagesOf(root).filter((page) => withBlanks || !isBlank(page));
+  return {
+    pages,
+    plan: pages.map((page) => ({ section: map.section.get(page) ?? 0, first: map.first.has(page) })),
+  };
+}
+
+/** Una hoja vacía con la forma y el encabezado y pie de la página anterior (Word los imprime en la página en blanco). */
+function blankAfter(previous: HTMLElement): HTMLElement {
+  const blank = previous.cloneNode(false) as HTMLElement;
+  blank.dataset.pliegoBlank = "";
+  const header = childrenOf(previous, "header")[0];
+  const article = childrenOf(previous, "article")[0];
+  const footer = childrenOf(previous, "footer")[0];
+  if (header) blank.appendChild(header.cloneNode(true));
+  if (article) blank.appendChild(article.cloneNode(false));
+  if (footer) blank.appendChild(footer.cloneNode(true));
+  return blank;
+}
+
+/** Pone (o saca) las páginas en blanco que hacen falta. Devuelve si cambió algo. */
+function placeBlanks(root: HTMLElement, map: PageMap, info: RenderInfo, numbering: SectionNumbering[]): boolean {
+  const { pages, plan } = planOf(root, map, false);
+  const wanted = new Set(planBlanks(plan, numbering, info.sections).map((index) => pages[index]!));
+  const existing = pagesOf(root).filter(isBlank);
+  const have = new Set(existing.map((blank) => blank.nextElementSibling as HTMLElement | null));
+  if (wanted.size === have.size && [...wanted].every((page) => have.has(page))) return false;
+  for (const blank of existing) {
+    map.section.delete(blank);
+    blank.remove();
+  }
+  for (const page of wanted) {
+    const previous = page.previousElementSibling as HTMLElement | null;
+    if (!previous?.matches(PAGE_SELECTOR)) continue;
+    const blank = blankAfter(previous);
+    previous.after(blank);
+    map.section.set(blank, map.section.get(previous) ?? 0);
+  }
+  return true;
+}
+
+export type LayoutResult = {
+  /** Páginas agregadas porque, con los márgenes del Word, el texto ya no entraba. */
+  added: number;
+  /** Páginas en blanco agregadas para que una sección empiece en página impar o par. */
+  blanks: number;
+  /** Páginas que siguen sin entrar (número de página en el PDF), mirando todas: reemplaza el tooTall de repaginate. */
+  tooTall: number[];
+  warnings: string[];
+};
+
+/**
+ * Aplica lo que el visor no hace: márgenes simétricos, margen de encuadernación y secciones que empiezan en página
+ * impar o par (con su página en blanco). Va después de repaginate y antes de numberPages. Al cambiar los márgenes el
+ * texto se reacomoda, así que se vuelve a repaginar hasta que todo quede quieto.
+ */
+export function applyLayout(
+  root: HTMLElement,
+  map: PageMap,
+  info: RenderInfo,
+  numbering: SectionNumbering[] = [],
+): LayoutResult {
+  const warnings: string[] = [];
+  const tooTall = new Set<HTMLElement>();
+  const needsMargins = info.mirrorMargins || info.sections.some((layout) => (layout.gutterPt ?? 0) > 0);
+  const needsParity = info.sections.some((layout) => wantedParity(layout) !== null);
+  let added = 0;
+  if (needsMargins || needsParity) {
+    let settled = false;
+    for (let round = 0; round < 6 && !settled; round += 1) {
+      const changed = needsParity ? placeBlanks(root, map, info, numbering) : false;
+      if (needsMargins) setMargins(root, map, info);
+      const more = flow(root, map, tooTall);
+      added += more;
+      if (changed || more) dress(root, map);
+      // Una vuelta sin páginas nuevas ni cambios en las en blanco: listo.
+      settled = !changed && !more;
+    }
+    if (!settled) {
+      warnings.push(
+        "No pude dejar quietas las páginas en blanco de las secciones que empiezan en página impar o par: revisá en la vista previa que cada capítulo empiece del lado que corresponde.",
+      );
+    }
+  }
+  // Se vuelve a mirar todo al final: vale también cuando no hubo nada que cambiar.
+  tooTall.clear();
+  for (const page of pagesOf(root)) if (overflows(page, sheetHeight(page))) tooTall.add(page);
+  if (needsParity) {
+    const { plan } = planOf(root, map, true);
+    for (const item of wrongSide(plan, info.sections)) {
+      const side = wantedParity(info.sections[item.section]) === 1 ? "derecha (impar)" : "izquierda (par)";
+      warnings.push(
+        `La sección ${item.section + 1} tiene que empezar en página ${side}, pero en el PDF cae en la página ${item.page}, del otro lado: pasa cuando el Word vuelve a numerar esa sección desde un número que no coincide. Revisá la numeración de esa sección en el Word.`,
+      );
+    }
+  }
+  const blanks = pagesOf(root).filter(isBlank).length;
+  return { added, blanks, tooTall: pageNumbers(root, tooTall), warnings };
+}
+
+/* ---------- Notas al pie ---------- */
+
+export type NotePage = { section: number; custom: boolean[] };
+
+/**
+ * El número de cada llamada (null = nota con marca propia, que no lleva número ni cuenta). Seguida en todo el
+ * documento, o de nuevo desde el inicio en cada sección o en cada página, como diga el Word.
+ */
+export function planFootnotes(
+  pages: NotePage[],
+  restart: RenderInfo["footnoteRestart"],
+  startAt: number,
+): Array<Array<number | null>> {
+  const start = Number.isFinite(startAt) && startAt >= 1 ? Math.floor(startAt) : 1;
+  let next = start;
+  let previous: number | null = null;
+  return pages.map((page) => {
+    if (restart === "eachPage" || (restart === "eachSect" && previous !== null && page.section !== previous)) next = start;
+    previous = page.section;
+    return page.custom.map((custom) => (custom ? null : next++));
+  });
+}
+
+/**
+ * Numera las llamadas a nota y la lista de notas de cada página (ol start y el número de cada nota). Las notas con
+ * marca propia quedan sin número: el símbolo ya está en el texto. Va al final, cuando ya no se mueven páginas.
+ */
+export function numberFootnotes(root: HTMLElement, info: RenderInfo, map: PageMap) {
+  const pages = pagesOf(root);
+  const refs = pages.map((page) => [...page.querySelectorAll(NOTE_REF)] as HTMLElement[]);
+  const plan = planFootnotes(
+    pages.map((page, index) => ({
+      section: map.section.get(page) ?? 0,
+      custom: refs[index]!.map((sup) => sup.dataset.pliegoCustom !== undefined),
+    })),
+    info.footnoteRestart,
+    info.footnoteStart,
+  );
+  pages.forEach((page, index) => {
+    const sups = refs[index]!;
+    if (!sups.length) return;
+    const numbers = plan[index]!;
+    const notes = notesList(page);
+    const items = notes ? ([...notes.children] as HTMLElement[]) : [];
+    sups.forEach((sup, i) => {
+      const n = numbers[i] ?? null;
+      const item = items[i] as HTMLLIElement | undefined;
+      sup.textContent = n === null ? "" : String(n);
+      if (!item) return;
+      if (n === null) {
+        item.style.listStyleType = "none";
+        item.removeAttribute("value");
+      } else {
+        item.style.listStyleType = "";
+        item.value = n;
+      }
+    });
+    const firstNumber = numbers.find((n): n is number => n !== null);
+    if (notes instanceof HTMLOListElement && firstNumber !== undefined) notes.start = firstNumber;
+  });
 }
 
 function roman(n: number): string {
