@@ -104,11 +104,24 @@ export function installFontFaces(faces: ShelfFace[], aliases: Array<{ face: Shel
   document.head.appendChild(style);
 }
 
-export async function registerShelfFonts(faces: ShelfFace[], aliases: Array<{ face: ShelfFace; family: string }>) {
+/**
+ * Registra en el PDF las fuentes subidas y, detrás, las que el Word trae incrustadas (`embedded`, ya descifradas).
+ * El orden importa: con dos caras iguales, el PDF usa la primera, así que una fuente subida gana sobre la del Word.
+ * Las sustitutas y lo demás declarado con @font-face lo encuentra solo el PDF (autoFonts) después de estas.
+ */
+export async function registerShelfFonts(
+  faces: ShelfFace[],
+  aliases: Array<{ face: ShelfFace; family: string }>,
+  embedded: Array<{ family: string; bytes: Uint8Array; weight: number; style: "normal" | "italic"; restricted?: boolean }> = [],
+) {
   const { registerFont, clearFonts, clearDiscoveredFonts } = await import("jsafa-pdf");
   clearFonts();
   clearDiscoveredFonts();
-  const jobs = [...faces.map((face) => ({ face, family: face.family })), ...aliases];
+  const jobs = [
+    ...faces.map((face) => ({ face, family: face.family })),
+    ...aliases,
+    ...embedded.filter((face) => !face.restricted).map((face) => ({ face, family: face.family })),
+  ];
   await Promise.all(
     jobs.map(({ face, family }) =>
       registerFont({
