@@ -7,11 +7,12 @@
  */
 
 /**
- * Lo que se apaga: ligaduras comunes, contextuales, opcionales e históricas, interletraje y la descomposición de letras
+ * Lo que se apaga (lo mismo que la vista previa con font-variant-ligatures: none): ligaduras comunes, contextuales,
+ * opcionales e históricas, formas contextuales, interletraje y la descomposición de letras
  * acentuadas (ccmp: con Cambria, «Í» pasaba a «I» más un acento suelto que al copiar el texto del PDF salía «IƵ»; la
  * letra ya viene compuesta en el texto y la fuente la tiene entera).
  */
-export const PDF_FONT_FEATURES = "{ liga: false, clig: false, dlig: false, hlig: false, kern: false, ccmp: false }";
+export const PDF_FONT_FEATURES = "{ liga: false, clig: false, dlig: false, hlig: false, calt: false, kern: false, ccmp: false }";
 
 const CALL = /\.embedFont\((\w+)\.bytes, \{ subset: ([^{}]+?) \}\)/g;
 

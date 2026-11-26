@@ -789,7 +789,10 @@ export async function fixLineSpacing(
     const lowest = measured.length ? measured.reduce((a, b) => (b.line < a.line ? b : a)) : null;
     // La letra del párrafo (el «puntal» invisible de cada renglón) pasa a ser la de su texto: si quedara la del estilo
     // y es más grande (un catálogo en letra chica dentro de un párrafo «Normal»), cada renglón sale más alto.
-    const strut = lowest?.face ?? texts[0]?.face ?? read.base;
+    // En un párrafo numerado, el número o la viñeta (que el visor dibuja con la letra del párrafo) va con la letra de la
+    // marca de párrafo, como en Word: ahí queda la de antes.
+    const numbered = [...p.classList].some((name) => name.startsWith(`${className}-num-`));
+    const strut = numbered ? read.base : (lowest?.face ?? texts[0]?.face ?? read.base);
     if (read.own.list !== strut.list) p.style.fontFamily = strut.list;
     if (Math.abs(read.own.size - strut.size) > 0.01) p.style.fontSize = round(strut.size);
     if (rule.kind === "exact") {

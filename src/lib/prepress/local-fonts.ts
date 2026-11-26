@@ -45,7 +45,10 @@ export async function localFontFiles(families: string[]): Promise<LocalFonts> {
   // Varias caras de una misma colección (cambria.ttc: Cambria y Cambria Math) traen el mismo archivo: va una vez.
   const seen = new Set<string>();
   for (const font of fonts) {
-    const family = wanted.get(fontKey(font.family));
+    // El navegador puede dar la familia tipográfica («Calibri») de una cara que Word llama distinto («Calibri Light»).
+    const family =
+      wanted.get(fontKey(font.family)) ??
+      [...wanted.entries()].find(([key]) => fontKey(font.fullName).startsWith(key) && key.length > fontKey(font.family).length)?.[1];
     if (!family) continue;
     const blob = await font.blob();
     const bytes = new Uint8Array(await blob.arrayBuffer());

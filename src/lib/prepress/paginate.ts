@@ -233,7 +233,7 @@ export function takeMarks(root: HTMLElement): PageMap {
  * Un párrafo que empieza con un salto de página manual (un título «ÍNDICE» con el salto adelante) queda partido en dos:
  * lo de antes del salto, sin nada visible, al final de la página anterior, y el texto en la página nueva. En Word ese
  * renglón del salto cuelga al pie de la página sin ocupar lugar (ni su espacio anterior): si la página ya estaba llena,
- * no se agrega una página en blanco. Acá ese pedazo vacío se esconde (queda en el documento, con sus marcadores).
+ * no se agrega una página en blanco. Acá ese pedazo vacío se saca.
  */
 function hangBreakLines(pages: HTMLElement[]) {
   for (let index = 1; index < pages.length; index += 1) {
@@ -245,8 +245,11 @@ function hangBreakLines(pages: HTMLElement[]) {
     const before = articles[articles.length - 1]?.lastElementChild as HTMLElement | null | undefined;
     if (!before || before.tagName !== "P" || before.className !== lead.className) continue;
     if ((before.textContent ?? "").trim() || before.querySelector("img, svg, object, canvas")) continue;
-    before.dataset.pliegoBreakLine = "";
-    before.style.display = "none";
+    // Fuera de la página (si quedara escondido, la paginación lo seguiría tomando por el último bloque); sus
+    // marcadores (los destinos del índice) pasan al principio del párrafo de la página nueva.
+    const anchors = [...before.querySelectorAll<HTMLElement>("[id]")];
+    lead.prepend(...anchors);
+    before.remove();
   }
 }
 

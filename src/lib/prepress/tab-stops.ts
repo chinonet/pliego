@@ -160,6 +160,9 @@ export function fixRightTabs(root: HTMLElement): number {
     if (!stops.length) continue;
     const tabs = [...paragraph.querySelectorAll<HTMLElement>(".docx-tab-stop")].filter((tab) => tab.closest("p") === paragraph);
     const style = view.getComputedStyle(paragraph);
+    // Un párrafo partido entre dos columnas (CSS) tiene una caja que abarca las dos: las medidas no sirven. Queda como
+    // lo calculó el visor.
+    if (paragraph.getClientRects().length > 1) continue;
     tabs.forEach((tab, index) => {
       const before = tab.style.wordSpacing;
       const beforeText = tab.textContent;
@@ -173,6 +176,7 @@ export function fixRightTabs(root: HTMLElement): number {
       // Las posiciones de Word se miden desde el borde de la columna, no desde la sangría del párrafo.
       const columnLeft = box.left - (Number.parseFloat(style.marginLeft) || 0) / scale;
       const lineEnd = toPt(box.right - (Number.parseFloat(style.paddingRight) || 0) / scale - columnLeft);
+      const lineStart = toPt(box.left + (Number.parseFloat(style.paddingLeft) || 0) / scale - columnLeft);
       const measure = () => {
         const rect = tab.getBoundingClientRect();
         return { left: toPt(rect.left - columnLeft), space: toPt(rect.width) };
@@ -194,11 +198,25 @@ export function fixRightTabs(root: HTMLElement): number {
           changed += 1;
           return;
         }
-        // Tampoco entra en el renglón: la tabulación y lo que sigue pasan al renglón de abajo.
+        // Tampoco entra en el renglón: la tabulación y lo que sigue pasan al renglón de abajo. Solo si bajar sirve: si
+        // la tabulación ya está al principio del renglón, o lo que sigue no entra ni en un renglón entero, queda pegado.
+        const top = tab.getBoundingClientRect().top;
+        if (left <= lineStart + 0.5 || following > lineEnd - lineStart + 0.01) {
+          setLeader(tab, "none");
+          changed += 1;
+          return;
+        }
         const br = paragraph.ownerDocument.createElement("br");
         br.dataset.pliegoTabBreak = "";
         tab.parentNode?.insertBefore(br, tab);
         ({ left } = measure());
+        if (tab.getBoundingClientRect().top <= top + 0.5) {
+          // No bajó (por ejemplo, ya estaba al principio de un renglón partido): sin salto.
+          br.remove();
+          setLeader(tab, "none");
+          changed += 1;
+          return;
+        }
         stop = stops.find((item) => item.pos > left + 0.01) ?? stop;
         fill = stop.pos - share(stop.align) * following - left;
       }

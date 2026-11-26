@@ -673,7 +673,10 @@ function addNoteSeparatorProbe(doc: XmlDocument, footnotes: XmlDocument | null):
     for (const child of children(copy)) if (["sectPr", "pPrChange"].includes(localName(child))) copy.removeChild(child);
     paragraph.appendChild(copy);
   }
-  paragraph.appendChild(markRun(doc, NOTE_SEPARATOR_MARK));
+  // Con la letra del tramo del separador (o la de la marca de párrafo): es la que mide el renglón en Word.
+  const separatorRun = descendants(source, "r").find((run) => children(run, "separator").length > 0);
+  const props = (separatorRun && children(separatorRun, "rPr")[0]) ?? (pPr ? children(pPr, "rPr")[0] : undefined);
+  paragraph.appendChild(markRun(doc, NOTE_SEPARATOR_MARK, props));
   const last = children(body, "sectPr")[0];
   body.insertBefore(paragraph, last ?? null);
   return true;
@@ -728,9 +731,13 @@ function applyStyleVertAlign(doc: XmlDocument, byStyle: Map<string, string>): nu
 
 /** Cambia cada w:footnoteRef (el número de la nota en su texto) por la marca y un «0» provisorio, en su mismo tramo. */
 function markNoteNumbers(doc: XmlDocument): number {
+  // El provisorio tiene tantas cifras como el número más alto posible: uno más angosto podía dejar un renglón de nota
+  // que, con el número de verdad, ya no entra.
+  const notes = descendants(doc, "footnote").filter((note) => !["separator", "continuationSeparator", "continuationNotice"].includes(attr(note, "type")));
+  const placeholder = "0".repeat(String(Math.max(1, notes.length + 9)).length);
   let count = 0;
   for (const ref of descendants(doc, "footnoteRef")) {
-    ref.parentNode?.replaceChild(newText(doc, `${NOTE_NUMBER_MARK}0`), ref);
+    ref.parentNode?.replaceChild(newText(doc, `${NOTE_NUMBER_MARK}${placeholder}`), ref);
     count += 1;
   }
   return count;

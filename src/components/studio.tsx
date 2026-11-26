@@ -177,11 +177,17 @@ export function Studio() {
     // Un archivo con alguna cara que ya se llama como una fuente del Word no presta su nombre a sus otras caras (en
     // «cambria.ttc», Cambria Math no pasa a ser «Cambria»).
     const named = new Set(
-      faces.filter((face) => needed.some((font) => fontKey(face.family) === fontKey(font.name))).map((face) => face.fileName),
+      faces
+        .filter((face) =>
+          needed.some((font) => [face.family, face.legacyFamily].some((name) => name && fontKey(name) === fontKey(font.name))),
+        )
+        .map((face) => face.fileName),
     );
     for (const face of faces) {
       const stem = fontKey(face.fileName.replace(/\.[^.]+$/, ""));
-      const byName = needed.filter((font) => fontKey(face.family) === fontKey(font.name));
+      // Primero por el nombre de siempre (nameID 1, el que usa Word: «Calibri Light»), después por la familia.
+      const byLegacy = face.legacyFamily ? needed.filter((font) => fontKey(face.legacyFamily!) === fontKey(font.name)) : [];
+      const byName = byLegacy.length ? byLegacy : needed.filter((font) => fontKey(face.family) === fontKey(font.name));
       const byFile = needed
         .filter((font) => {
           const key = fontKey(font.name);
@@ -498,7 +504,10 @@ export function Studio() {
         return;
       }
       const wanted = new Set(families.map(fontKey));
-      await addFonts(local.files, (face) => wanted.has(fontKey(face.family)));
+      await addFonts(
+        local.files,
+        (face) => wanted.has(fontKey(face.family)) || (face.legacyFamily !== undefined && wanted.has(fontKey(face.legacyFamily))),
+      );
       if (local.missing.length) {
         setError(
           `Se usan las fuentes de la computadora. No están instaladas: ${local.missing.join(", ")}${

@@ -1,5 +1,7 @@
 export type ParsedFace = {
   family: string;
+  /** El nombre de familia de siempre (nameID 1), el que usa Word: «Calibri Light» aunque la familia sea «Calibri». */
+  legacyFamily?: string;
   subfamily: string;
   weight: number;
   style: "normal" | "italic";
@@ -94,7 +96,8 @@ function parseSfnt(bytes: Uint8Array, base: number): ParsedFace {
     if (selection & 1) style = "italic";
   }
 
-  return { family, subfamily, weight, style };
+  const legacy = names.get(1);
+  return { family, subfamily, weight, style, ...(legacy && legacy !== family ? { legacyFamily: legacy } : {}) };
 }
 
 /**

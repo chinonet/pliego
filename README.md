@@ -4,12 +4,16 @@ Convierte un Word (.docx) en un PDF para premedia, en el navegador.
 
 - Quita marcas de revisión (también filas, celdas y fines de párrafo borrados) y comentarios; deja las notas al pie.
 - No vuelve a comprimir las imágenes: las fotos pasan tal cual y los PNG con sus mismos píxeles.
-- Usa las fuentes que el Word trae incrustadas y completa con las que ya trae la app (Calibri, Cambria, Arial, Times
-  New Roman, Courier New, Tahoma, Candara, MS Gothic, Symbol y Wingdings); cada fuente va una sola vez en el PDF.
+- Usa las fuentes que el Word trae incrustadas, las que subas y, con «Usar las fuentes de esta computadora» (Chrome y
+  Edge), las instaladas en la PC, sin subirlas a ningún lado. Si no, completa con las de la app: Tahoma, Candara, MS
+  Gothic, Symbol y Wingdings son las verdaderas; Calibri, Cambria, Arial, Times y Courier, unas parecidas del mismo
+  ancho (la app lo dice). Cada fuente va una sola vez en el PDF, sin ligaduras ni interletraje, como Word.
 - Pagina como Word, renglón por renglón: interlineado de cada letra, párrafos partidos con viudas y huérfanas, tablas
   partidas por filas (con sus filas de título), sin espacio anterior arriba de la página, notas al pie con su llamada y
   numeradas como en el Word, márgenes simétricos y de encuadernación, capítulos en página impar o par, secciones
-  continuas, encabezados y pies por sección y por página par o impar, números de página reales (`\* roman`).
+  continuas, encabezados y pies por sección y por página par o impar, números de página reales (`\* roman`),
+  tabulaciones a la derecha como Word (los números de un índice), párrafos vacíos con el alto de su marca de párrafo,
+  el renglón del separador de notas reservado y dibujado, y el número de cada nota en su texto.
 - Lo que el PDF no vería por sí solo pasa a texto antes de exportar: números de lista, versalitas y mayúsculas de
   estilo, subrayados, puntos guía, guiones de corte; el justificado no estira las letras; las imágenes recortadas salen
   recortadas.
