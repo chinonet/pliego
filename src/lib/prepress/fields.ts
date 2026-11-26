@@ -180,27 +180,41 @@ function markFootnoteReferences(doc: XmlDocument) {
   }
 }
 
+/**
+ * Solo el salto de página manual: las marcas de corte que Word deja guardadas (lastRenderedPageBreak) el visor ya no
+ * las usa para cortar.
+ */
 function isPageBreak(node: XmlElement): boolean {
+  return localName(node) === "br" && attr(node, "type") === "page";
+}
+
+/** Lo que se ve en el renglón: si hay algo de esto antes del salto, el salto no abre la sección. */
+const VISIBLE = new Set(["t", "tab", "ptab", "drawing", "pict", "object", "sym", "noBreakHyphen", "footnoteReference", "endnoteReference"]);
+
+function isVisible(node: XmlElement): boolean {
   const name = localName(node);
-  return name === "lastRenderedPageBreak" || (name === "br" && attr(node, "type") === "page");
+  if (name === "t") return (node.textContent ?? "") !== "";
+  return VISIBLE.has(name);
 }
 
 /**
- * La marca de comienzo de sección va en el primer párrafo. Si ese párrafo empieza con el salto de página que Word dejó
- * guardado, la marca va después del salto: si no, el visor la deja en la última página de la sección anterior.
+ * La marca de comienzo de sección va en el primer párrafo. Si ese párrafo empieza con un salto de página (sin nada
+ * visible antes), la marca va después del salto: si no, el visor la deja en la última página de la sección anterior.
+ * Si hay texto antes del salto (un «PRIMERA PARTE» y después el salto), la sección empieza con ese texto: la marca va
+ * al comienzo del párrafo.
  */
 function placeSectionMark(doc: XmlDocument, paragraph: XmlElement, mark: string) {
   for (const run of runsOf(paragraph)) {
     const parts = children(run);
     const breakAt = parts.findIndex(isPageBreak);
-    if (breakAt >= 0) {
+    if (breakAt >= 0 && !parts.slice(0, breakAt).some(isVisible)) {
       const after = parts[breakAt]!.nextSibling;
       const text = newText(doc, mark);
       if (after) run.insertBefore(text, after);
       else run.appendChild(text);
       return;
     }
-    if (parts.some((part) => localName(part) === "t")) break;
+    if (parts.some(isVisible)) break;
   }
   const props = children(paragraph, "pPr")[0];
   const run = newRun(doc, mark);
