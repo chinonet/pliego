@@ -59,6 +59,17 @@
    nada) y con alto fijo el texto que sobra se va a columnas fuera de la hoja sin que la repaginación lo vea. El llenado
    en orden, como Word, lo hace la composición después de repaginar y solo donde entra todo. */
 
+/* Segunda parte de un párrafo que se partió entre dos páginas: no repite el número o la viñeta de lista ni cuenta
+   otra vez en la numeración. */
+.pliego-stage section.docx .pliego-sigue {
+  counter-increment: none !important;
+}
+
+.pliego-stage section.docx .pliego-sigue::before {
+  content: none !important;
+  counter-increment: none !important;
+}
+
 /* Mientras se arma el PDF: la hoja sin el color de papel de la pantalla (si no, sale impreso en cada página). */
 .pliego-stage .pliego-exporting section.docx {
   background: transparent !important;

@@ -221,7 +221,9 @@ export function Studio() {
       className: "docx",
       inWrapper: true,
       breakPages: true,
-      ignoreLastRenderedPageBreak: false,
+      // Las páginas se cortan por altura, renglón por renglón (paginate.ts). Las marcas de corte que Word deja guardadas
+      // suelen estar viejas y, junto a un salto manual, armaban páginas vacías.
+      ignoreLastRenderedPageBreak: true,
       renderHeaders: true,
       renderFooters: true,
       renderFootnotes: true,

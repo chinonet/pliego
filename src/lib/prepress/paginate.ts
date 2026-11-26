@@ -133,7 +133,15 @@ function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): numbe
     const current = page;
     const height = sheetHeight(current);
     const blocks = () => childrenOf(current, "article").reduce((sum, article) => sum + article.children.length, 0);
-    if (overflows(current, height) && blocks() > 1) {
+    const lastBlock = () => {
+      const articles = childrenOf(current, "article").filter((article) => article.children.length > 0);
+      return (articles[articles.length - 1]?.lastElementChild as HTMLElement | null) ?? null;
+    };
+    const canSplit = () => {
+      const block = lastBlock();
+      return Boolean(block && ((block.tagName === "P" && linesOf(block).length >= 4) || (block.tagName === "TABLE" && (block as HTMLTableElement).rows.length > 1)));
+    };
+    if (overflows(current, height) && (blocks() > 1 || canSplit())) {
       const fresh = current.cloneNode(false) as HTMLElement;
       delete fresh.dataset.pliegoBlank;
       const header = childrenOf(current, "header")[0];
@@ -145,7 +153,7 @@ function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): numbe
       added += 1;
       const freshArticles = new Map<HTMLElement, HTMLElement>();
       let freshNotes: HTMLElement | null = null;
-      while (overflows(current, height) && blocks() > 1) {
+      while (overflows(current, height) && (blocks() > 1 || canSplit())) {
         const articles = childrenOf(current, "article").filter((article) => article.children.length > 0);
         const source = articles[articles.length - 1]!;
         let target = freshArticles.get(source);
@@ -155,8 +163,27 @@ function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): numbe
           const before = childrenOf(fresh, "article")[0] ?? childrenOf(fresh, "ol")[0] ?? childrenOf(fresh, "footer")[0];
           fresh.insertBefore(target, before ?? null);
         }
-        const block = source.lastElementChild as HTMLElement;
-        target.insertBefore(block, target.firstChild);
+        const last = source.lastElementChild as HTMLElement;
+        let block: HTMLElement = last;
+        if (last.tagName === "TABLE" && (last as HTMLTableElement).rows.length > 1) {
+          // Una tabla que no entra se parte por filas: las que sobran van a una copia de la tabla en la página nueva.
+          const table = last as HTMLTableElement;
+          const tail = table.cloneNode(false) as HTMLTableElement;
+          tail.removeAttribute("id");
+          for (const part of [...table.children]) if (part.tagName === "COLGROUP") tail.appendChild(part.cloneNode(true));
+          target.insertBefore(tail, target.firstChild);
+          while (overflows(current, height) && table.rows.length > 1) {
+            const row = table.rows[table.rows.length - 1]!;
+            const firstRow = tail.rows[0];
+            if (firstRow) firstRow.before(row);
+            else tail.appendChild(row);
+          }
+          block = tail;
+        } else {
+          const tail = splitParagraph(last, current.offsetHeight - height);
+          block = tail ?? last;
+          target.insertBefore(block, target.firstChild);
+        }
         // Las notas de las llamadas que se movieron son las últimas de la lista de esta página.
         const moved = block.querySelectorAll(NOTE_REF).length;
         const notes = notesList(current);
@@ -178,6 +205,83 @@ function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): numbe
     page = following?.matches(PAGE_SELECTOR) ? following : null;
   }
   return added;
+}
+
+/** Los renglones de un párrafo (cajas agrupadas por altura), de arriba abajo. */
+function linesOf(block: HTMLElement): Array<{ top: number; bottom: number }> {
+  const range = block.ownerDocument.createRange();
+  range.selectNodeContents(block);
+  const rects = [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+  rects.sort((a, b) => a.top - b.top);
+  const lines: Array<{ top: number; bottom: number }> = [];
+  for (const rect of rects) {
+    const last = lines[lines.length - 1];
+    // Misma línea si se superponen en más de la mitad del alto.
+    if (last && rect.top < last.bottom - Math.min(rect.height, last.bottom - last.top) / 2) {
+      last.bottom = Math.max(last.bottom, rect.bottom);
+      last.top = Math.min(last.top, rect.top);
+    } else {
+      lines.push({ top: rect.top, bottom: rect.bottom });
+    }
+  }
+  return lines;
+}
+
+/** El primer carácter que cae en el renglón que empieza en «top» (o null). */
+function firstCharAt(block: HTMLElement, top: number): { node: Text; offset: number } | null {
+  const doc = block.ownerDocument;
+  const walker = doc.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  const range = doc.createRange();
+  const charTop = (node: Text, i: number) => {
+    range.setStart(node, i);
+    range.setEnd(node, i + 1);
+    const rects = [...range.getClientRects()].filter((rect) => rect.height > 0);
+    return rects.length ? rects[rects.length - 1]!.top : -Infinity;
+  };
+  for (let node = walker.nextNode() as Text | null; node; node = walker.nextNode() as Text | null) {
+    const length = node.data.length;
+    if (!length || charTop(node, length - 1) < top - 1) continue;
+    let lo = 0;
+    let hi = length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (charTop(node, mid) >= top - 1) hi = mid;
+      else lo = mid + 1;
+    }
+    return { node, offset: lo };
+  }
+  return null;
+}
+
+/**
+ * Parte un párrafo en el renglón que cruza el pie de la hoja, como Word: quedan al menos dos renglones de cada lado
+ * (viudas y huérfanas). La primera parte no lleva espacio después y, si es justificado, su último renglón también se
+ * justifica; la segunda no repite la sangría, el espacio antes ni el número de lista. Devuelve la segunda parte, o null
+ * si no conviene partirlo (entonces pasa entero).
+ */
+function splitParagraph(block: HTMLElement, excess: number): HTMLElement | null {
+  if (block.tagName !== "P") return null;
+  const lines = linesOf(block);
+  if (lines.length < 4) return null;
+  const style = getComputedStyle(block);
+  const bottom = block.getBoundingClientRect().bottom + (Number.parseFloat(style.marginBottom) || 0) - excess;
+  let keep = lines.filter((line) => line.bottom <= bottom + 0.5).length;
+  if (keep > lines.length - 2) keep = lines.length - 2;
+  if (keep < 2) return null;
+  const at = firstCharAt(block, lines[keep]!.top);
+  if (!at) return null;
+  const range = block.ownerDocument.createRange();
+  range.setStart(at.node, at.offset);
+  range.setEnd(block, block.childNodes.length);
+  const tail = block.cloneNode(false) as HTMLElement;
+  tail.removeAttribute("id");
+  tail.appendChild(range.extractContents());
+  tail.classList.add("pliego-sigue");
+  tail.style.textIndent = "0";
+  tail.style.marginTop = "0";
+  block.style.marginBottom = "0";
+  if (style.textAlign === "justify") block.style.textAlignLast = "justify";
+  return tail;
 }
 
 /** Cada página lleva el encabezado y el pie que le tocan por sección y por página par o impar. */
