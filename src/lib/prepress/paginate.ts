@@ -131,6 +131,7 @@ function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): numbe
   let page = root.querySelector(PAGE_SELECTOR) as HTMLElement | null;
   while (page) {
     const current = page;
+    suppressTopSpace(current);
     const height = sheetHeight(current);
     const blocks = () => childrenOf(current, "article").reduce((sum, article) => sum + article.children.length, 0);
     const lastBlock = () => {
@@ -282,6 +283,14 @@ function splitParagraph(block: HTMLElement, excess: number): HTMLElement | null 
   block.style.marginBottom = "0";
   if (style.textAlign === "justify") block.style.textAlignLast = "justify";
   return tail;
+}
+
+/** Como Word: el primer párrafo de la página no lleva el espacio anterior (un título de capítulo arranca en el margen). */
+function suppressTopSpace(page: HTMLElement) {
+  const article = childrenOf(page, "article").find((item) => item.children.length > 0);
+  const first = article?.firstElementChild as HTMLElement | null | undefined;
+  if (!first || first.tagName !== "P" || first.style.marginTop === "0px") return;
+  if ((Number.parseFloat(getComputedStyle(first).marginTop) || 0) > 0) first.style.marginTop = "0px";
 }
 
 /** Cada página lleva el encabezado y el pie que le tocan por sección y por página par o impar. */
