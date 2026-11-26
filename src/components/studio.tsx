@@ -15,6 +15,8 @@ import { fontKey } from "@/lib/prepress/font-face";
 import { forgetFace, installFontFaces, loadShelf, readFontFile, rememberFace, registerShelfFonts, type ShelfFace } from "@/lib/prepress/font-shelf";
 import { installSubstitutes, loadSubstituteFaces, SUBSTITUTE_FACES } from "@/lib/prepress/substitutes";
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
+import { markPageFields } from "@/lib/prepress/fields";
+import { numberPages, repaginate, takeSectionMarks } from "@/lib/prepress/paginate";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -105,10 +107,13 @@ export function Studio() {
   const [substitutes, setSubstitutes] = useState(true);
   const substitutesRef = useRef(true);
   const [cropMarks, setCropMarks] = useState(false);
+  const [grayscale, setGrayscale] = useState(false);
+  const [press, setPress] = useState<{ pdfx: boolean; problems: string[] } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [shelf, setShelf] = useState<ShelfFace[]>([]);
   const [imageChecks, setImageChecks] = useState<Array<{ label: string; ppi: number; pixels: string }>>([]);
   const [pageMm, setPageMm] = useState("");
+  const [tooTall, setTooTall] = useState<number[]>([]);
 
   function measure() {
     const doc = docRef.current;
@@ -183,7 +188,9 @@ export function Studio() {
     if (!body || !style) throw new Error("No está el visor.");
     body.replaceChildren();
     style.replaceChildren();
-    await renderAsync(bytes, body, style, {
+    // Copia solo para componer: los números de página se escriben después, página por página.
+    const marked = await markPageFields(bytes);
+    await renderAsync(marked.bytes, body, style, {
       className: "docx",
       inWrapper: true,
       breakPages: true,
@@ -203,9 +210,12 @@ export function Studio() {
     }
     for (const face of shelfRef.current) covered.add(face.family.toLowerCase());
     for (const alias of aliases) covered.add(alias.family.toLowerCase());
+    // Solo se quitan las fuentes incrustadas (@font-face) que la app reemplaza. Los demás bloques son los estilos,
+    // el tema y la numeración del Word: si se borran, el documento pierde su letra, sus tamaños y sus sangrías.
     for (const node of [...style.querySelectorAll("style")]) {
-      const css = node.textContent ?? "";
-      const family = /font-family:\s*([^;]+)/i.exec(css)?.[1]?.trim().replace(/^['"]+|['"]+$/g, "").toLowerCase();
+      const css = (node.textContent ?? "").trim();
+      if (!/^@font-face/i.test(css)) continue;
+      const family = /font-family:\s*([^;}]+)/i.exec(css)?.[1]?.trim().replace(/^['"]+|['"]+$/g, "").toLowerCase();
       if (family && covered.has(family)) node.remove();
     }
     for (const id of ["pliego-substitutes", "pliego-uploaded-fonts"]) {
@@ -219,8 +229,6 @@ export function Studio() {
       );
       await document.fonts.ready;
     }
-    const pages = body.querySelectorAll("section.docx").length;
-    setPageCount(pages);
     const images = [...body.querySelectorAll("section.docx img")] as HTMLImageElement[];
     await Promise.all(
       images.map(
@@ -233,6 +241,12 @@ export function Studio() {
               }),
       ),
     );
+    const starts = takeSectionMarks(body);
+    const flow = repaginate(body);
+    numberPages(body, marked.sections, starts);
+    setTooTall(flow.tooTall);
+    const pages = body.querySelectorAll("section.docx").length;
+    setPageCount(pages);
     const first = body.querySelector("section.docx") as HTMLElement | null;
     if (first) {
       const width = Math.round((first.offsetWidth / 96) * 25.4);
@@ -257,6 +271,7 @@ export function Studio() {
   async function process(input: Uint8Array, filename: string, clean: CleanOptions) {
     setPhase("working");
     setError("");
+    setPress(null);
     setStatus("Leyendo el Word");
     nameRef.current = filename;
     setName(filename);
@@ -409,33 +424,38 @@ export function Studio() {
       setFit(false);
       setScale(1);
     });
+    // Sin el fondo de «papel» ni la sombra de la pantalla: en el PDF la hoja es blanca, sin un rectángulo crema.
+    doc.classList.add("pliego-exporting");
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     try {
       const sections = [...doc.querySelectorAll("section.docx")] as HTMLElement[];
       await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current));
-      let bytes: Uint8Array;
+      let result: Awaited<ReturnType<typeof exportPagesToPdf>>;
       try {
-        bytes = await exportPagesToPdf(sections, {
+        result = await exportPagesToPdf(sections, {
           title: stem(nameRef.current),
           subset: !fullFont,
           cropMarks,
+          grayscale,
         });
       } catch (err) {
         if (!fullFont) throw err;
-        bytes = await exportPagesToPdf(sections, { title: stem(nameRef.current), subset: true, cropMarks });
+        result = await exportPagesToPdf(sections, { title: stem(nameRef.current), subset: true, cropMarks, grayscale });
         setFullFont(false);
         setError("Esa fuente no permite incrustarse entera. Se incrustó el subconjunto usado.");
       }
-      saveBytes(bytes, `${stem(nameRef.current)}.pdf`, "application/pdf");
+      setPress({ pdfx: result.pdfx, problems: result.problems });
+      saveBytes(result.bytes, `${stem(nameRef.current)}.pdf`, "application/pdf");
       setStatus("");
     } catch (err) {
       setError(
         err instanceof Error
-          ? `${err.message} Puedes usar «Imprimir» y guardar como PDF desde el navegador.`
+          ? err.message
           : "No se pudo escribir el PDF.",
       );
       setStatus("");
     } finally {
+      doc.classList.remove("pliego-exporting");
       flushSync(() => setFit(previousFit));
       requestAnimationFrame(measure);
     }
@@ -558,7 +578,13 @@ export function Studio() {
               pressed={cropMarks}
               onClick={() => setCropMarks((value) => !value)}
               label="Marcas de corte"
-              hint="Trazos vectoriales fuera de la página. No recortan ni recomprimen las imágenes."
+              hint="Solo para imprenta offset. IngramSpark / Lightning Source no las acepta: dejalas apagadas."
+            />
+            <Toggle
+              pressed={grayscale}
+              onClick={() => setGrayscale((value) => !value)}
+              label="Interior en blanco y negro"
+              hint="Para IngramSpark / Lightning Source en B/N: las imágenes PNG pasan a escala de grises sin perder calidad y el PDF sale PDF/X-1a. Los JPEG no se tocan."
             />
             <Toggle
               pressed={substitutes}
@@ -679,6 +705,37 @@ export function Studio() {
                 </li>
               ))}
             </ul>
+          ) : null}
+
+          {tooTall.length ? (
+            <p className="flex gap-2 text-sm text-accent">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+              <span>
+                {tooTall.length === 1 ? "La página" : "Las páginas"} {tooTall.join(", ")}{" "}
+                {tooTall.length === 1 ? "no entra" : "no entran"} en la hoja: una tabla o una imagen es más alta que
+                la página. En el PDF {tooTall.length === 1 ? "saldría" : "saldrían"} más largas que el corte.
+              </span>
+            </p>
+          ) : null}
+
+          {press ? (
+            press.pdfx ? (
+              <p className="text-sm text-muted">
+                El último PDF salió PDF/X-1a:2001: tamaño de corte declarado, fuentes incrustadas y todo en gris.
+              </p>
+            ) : (
+              <div className="grid gap-1 text-sm text-accent">
+                <p className="flex gap-2">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+                  <span>El último PDF no es PDF/X-1a. Lo que falta:</span>
+                </p>
+                <ul className="grid list-disc gap-1 pl-6">
+                  {press.problems.map((problem) => (
+                    <li key={problem}>{problem}</li>
+                  ))}
+                </ul>
+              </div>
+            )
           ) : null}
 
           {error ? <p className="text-sm text-accent">{error}</p> : null}

@@ -47,6 +47,12 @@
   margin: 0 !important;
 }
 
+/* Mientras se arma el PDF: la hoja sin el color de papel de la pantalla (si no, sale impreso en cada página). */
+.pliego-stage .pliego-exporting section.docx {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
 @media print {
   body {
     background: white !important;
