@@ -47,6 +47,18 @@
   margin: 0 !important;
 }
 
+/* Sin división automática del navegador: no corta como Word y movería renglones y páginas. Los guiones opcionales
+   que vienen del Word se siguen respetando. (El visor la prende en toda la hoja y por párrafo, por eso va en todos.) */
+.pliego-stage section.docx,
+.pliego-stage section.docx * {
+  -webkit-hyphens: manual !important;
+  hyphens: manual !important;
+}
+
+/* Columnas: quedan equilibradas, como las deja el navegador. column-fill: auto acá no sirve (sin alto fijo no hace
+   nada) y con alto fijo el texto que sobra se va a columnas fuera de la hoja sin que la repaginación lo vea. El llenado
+   en orden, como Word, lo hace la composición después de repaginar y solo donde entra todo. */
+
 /* Mientras se arma el PDF: la hoja sin el color de papel de la pantalla (si no, sale impreso en cada página). */
 .pliego-stage .pliego-exporting section.docx {
   background: transparent !important;
