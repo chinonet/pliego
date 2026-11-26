@@ -26,6 +26,7 @@ import {
 } from "@/lib/prepress/substitutes";
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
+import { fixDefaultStyleSelectors } from "@/lib/prepress/docx-css";
 import { applyLayout, numberFootnotes, numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
 import { DEFAULT_RENDER_INFO, prepareRenderCopy, type RenderInfo } from "@/lib/prepress/render-copy";
 import { fixCroppedImages, prepareForExport } from "@/lib/prepress/prepare-export";
@@ -244,7 +245,12 @@ export function Studio() {
     );
     for (const node of [...style.querySelectorAll("style")]) {
       const css = (node.textContent ?? "").trim();
-      if (!/^@font-face/i.test(css)) continue;
+      if (!/^@font-face/i.test(css)) {
+        // La letra del estilo predeterminado (Normal) tiene que ir al texto, como en Word.
+        const fixed = fixDefaultStyleSelectors(css, "docx");
+        if (fixed !== css) node.textContent = fixed;
+        continue;
+      }
       const family = /font-family:\s*([^;}]+)/i.exec(css)?.[1]?.trim().replace(/^['"]+|['"]+$/g, "") ?? "";
       const weight = /font-weight:\s*bold/i.test(css) ? 700 : 400;
       const italic = /font-style:\s*italic/i.test(css) ? "italic" : "normal";
