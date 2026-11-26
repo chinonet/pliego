@@ -13,6 +13,22 @@ export type PdfExport = {
   pdfx: boolean;
   /** Lo que impide declararlo PDF/X-1a, en palabras para quien edita. */
   problems: string[];
+  /**
+   * true si quedó alguna fuente OpenType (OTF) entera y se pidió sin recortar: volviendo a exportar con
+   * `subset: true` se arregla sola. Con `subset: true` ya pedido queda en false (el aviso sigue en `problems`).
+   */
+  needsSubset: boolean;
+};
+
+export type ExportOptions = {
+  title: string;
+  subset: boolean;
+  cropMarks?: boolean;
+  grayscale?: boolean;
+  /** Sangrado de 0,125" (9 pt) arriba, abajo y en el borde de afuera (nunca en el lomo). */
+  bleed?: boolean;
+  /** Para PDF/X: las imágenes con transparencia (PNG sin pérdida) se componen sobre blanco, sin recomprimir. */
+  flatten?: boolean;
 };
 
 type PdfLib = typeof import("pdf-lib");
@@ -26,7 +42,7 @@ type PdfLib = typeof import("pdf-lib");
  */
 export async function exportPagesToPdf(
   sections: HTMLElement[],
-  opts: { title: string; subset: boolean; cropMarks?: boolean; grayscale?: boolean },
+  opts: ExportOptions,
 ): Promise<PdfExport> {
   const { toPdf } = await import("jsafa-pdf");
   const lib = await import("pdf-lib");
@@ -39,6 +55,7 @@ export async function exportPagesToPdf(
   merged.setCreator("Pliego");
   merged.setProducer("Pliego premedia");
 
+  let pageIndex = 0;
   for (const section of sections) {
     const bytes = await toPdf(section, {
       subset: opts.subset,
@@ -50,15 +67,24 @@ export async function exportPagesToPdf(
     const copied = await merged.copyPages(part, part.getPageIndices());
     for (const page of copied) {
       const { width, height } = page.getSize();
-      // El corte es la página del Word, con o sin marcas alrededor.
-      page.setTrimBox(0, 0, width, height);
-      page.setBleedBox(0, 0, width, height);
-      if (opts.cropMarks) drawCropMarks(page, grayscale);
+      // El corte es la página del Word; el sangrado y las marcas quedan alrededor, sin mover el contenido.
+      const boxes = pressBoxes(pageIndex, width, height, { bleed: opts.bleed, cropMarks: opts.cropMarks });
+      pageIndex += 1;
+      const { media, trim, bleed } = boxes;
+      if (media.x !== 0 || media.y !== 0 || media.width !== width || media.height !== height) {
+        // Sin CropBox el visor muestra la MediaBox entera: así se ven el sangrado y las marcas.
+        page.node.delete(lib.PDFName.of("CropBox"));
+        page.setMediaBox(media.x, media.y, media.width, media.height);
+      }
+      page.setTrimBox(trim.x, trim.y, trim.width, trim.height);
+      page.setBleedBox(bleed.x, bleed.y, bleed.width, bleed.height);
+      if (boxes.marks.length) drawCropMarks(page, grayscale, boxes.marks);
       merged.addPage(page);
     }
   }
 
-  const problems = prepareForPress(lib, merged, Boolean(opts.grayscale));
+  const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset);
+  const problems = found.problems;
   shareFontPrograms(lib, merged);
   const pdfx = problems.length === 0;
   if (pdfx) declarePdfX1a(lib, merged, opts.title);
@@ -69,22 +95,39 @@ export async function exportPagesToPdf(
   const bytes = await merged.save({ useObjectStreams: false });
   // pdf-lib siempre escribe «%PDF-1.7»; PDF/X-1a:2001 pide 1.3. Mismo largo: no se corre ningún desplazamiento.
   setHeaderVersion(bytes, pdfx ? "1.3" : "1.4");
-  return { bytes, pdfx, problems };
+  return { bytes, pdfx, problems, needsSubset: found.wholeOtf && !opts.subset };
 }
 
-/** Marcas de corte en vectores, fuera del recorte. No tocan las imágenes. */
-function drawCropMarks(
-  page: import("pdf-lib").PDFPage,
-  grayscale: typeof import("pdf-lib").grayscale,
-) {
-  const width = page.getWidth();
-  const height = page.getHeight();
-  const gap = 6;
+export type Box = { x: number; y: number; width: number; height: number };
+export type MarkLine = [[number, number], [number, number]];
+
+/** 0,125" en puntos: el sangrado que pide Lightning Source. */
+export const BLEED = 9;
+
+/**
+ * Las cajas de una página, en el mismo sistema de coordenadas del contenido (que no se mueve): el corte es la
+ * página del Word; el sangrado agrega 9 pt arriba, abajo y afuera (derecha en las impares — índice 0, 2… —,
+ * izquierda en las pares), nunca en el lomo. Las marcas de corte van por fuera del sangrado.
+ * Ojo: el sangrado queda vacío salvo que algo del Word llegue hasta el borde de la hoja; el visor no estira nada.
+ */
+export function pressBoxes(
+  index: number,
+  width: number,
+  height: number,
+  opts: { bleed?: boolean; cropMarks?: boolean } = {},
+): { media: Box; trim: Box; bleed: Box; marks: MarkLine[] } {
+  const trim: Box = { x: 0, y: 0, width, height };
+  const recto = index % 2 === 0;
+  const bleed: Box = opts.bleed
+    ? { x: recto ? 0 : -BLEED, y: -BLEED, width: width + BLEED, height: height + BLEED * 2 }
+    : { ...trim };
+  if (!opts.cropMarks) return { media: { ...bleed }, trim, bleed, marks: [] };
+  // Las marcas siguen las líneas de corte y empiezan donde termina el sangrado (más un respiro).
+  const gap = opts.bleed ? BLEED + 3 : 6;
   const len = 14;
   const pad = gap + len;
-  page.setMediaBox(-pad, -pad, width + pad * 2, height + pad * 2);
-  const ink = grayscale(0);
-  const lines: Array<[[number, number], [number, number]]> = [
+  const media: Box = { x: -pad, y: -pad, width: width + pad * 2, height: height + pad * 2 };
+  const marks: MarkLine[] = [
     [[-pad, 0], [-gap, 0]],
     [[0, -pad], [0, -gap]],
     [[width + gap, 0], [width + pad, 0]],
@@ -94,6 +137,16 @@ function drawCropMarks(
     [[width + gap, height], [width + pad, height]],
     [[width, height + gap], [width, height + pad]],
   ];
+  return { media, trim, bleed, marks };
+}
+
+/** Marcas de corte en vectores, fuera del recorte (y del sangrado). No tocan las imágenes. */
+function drawCropMarks(
+  page: import("pdf-lib").PDFPage,
+  grayscale: typeof import("pdf-lib").grayscale,
+  lines: MarkLine[],
+) {
+  const ink = grayscale(0);
   for (const [start, end] of lines) {
     page.drawLine({
       start: { x: start[0], y: start[1] },
@@ -182,33 +235,93 @@ function contentRefs(lib: PdfLib, page: PDFPageType): PDFRefType[] {
 
 /** Imagen RGB sin pérdida (Flate, 8 bits, sin predictor) → gris, también sin pérdida. Una transparencia se compone sobre blanco. */
 function imageToGray(lib: PdfLib, context: PDFContextType, ref: PDFRefType): boolean {
+  const image = readFlateImage(lib, context, ref);
   const stream = context.lookup(ref);
-  if (!(stream instanceof lib.PDFRawStream)) return false;
+  if (!image || image.channels !== 3 || !(stream instanceof lib.PDFRawStream)) return false;
+  let gray = rgbToGray(image.pixels);
+  if (image.alpha) gray = compositeOnWhite(gray, image.alpha, 1);
   const dict = stream.dict;
-  if (nameOf(lib, context, dict.get(lib.PDFName.of("Filter"))) !== "FlateDecode") return false;
-  if (dict.get(lib.PDFName.of("DecodeParms"))) return false;
-  if (nameOf(lib, context, dict.get(lib.PDFName.of("ColorSpace"))) !== "DeviceRGB") return false;
-  if (numberOf(lib, context, dict.get(lib.PDFName.of("BitsPerComponent"))) !== 8) return false;
-  const pixels = lib.decodePDFRawStream(stream).decode();
-  let alpha: Uint8Array | null = null;
-  const maskRef = dict.get(lib.PDFName.of("SMask"));
-  if (maskRef instanceof lib.PDFRef) {
-    const mask = context.lookup(maskRef);
-    if (!(mask instanceof lib.PDFRawStream)) return false;
-    if (nameOf(lib, context, mask.dict.get(lib.PDFName.of("Filter"))) !== "FlateDecode") return false;
-    if (mask.dict.get(lib.PDFName.of("DecodeParms"))) return false;
-    alpha = lib.decodePDFRawStream(mask).decode();
-    if (alpha.length * 3 !== pixels.length) return false;
-  }
-  const gray = new Uint8Array(pixels.length / 3);
-  for (let i = 0, j = 0; j < gray.length; i += 3, j += 1) {
-    let y = Math.round(0.299 * pixels[i]! + 0.587 * pixels[i + 1]! + 0.114 * pixels[i + 2]!);
-    if (alpha) y = Math.round((y * alpha[j]! + 255 * (255 - alpha[j]!)) / 255);
-    gray[j] = y;
-  }
   dict.set(lib.PDFName.of("ColorSpace"), lib.PDFName.of("DeviceGray"));
   replaceStream(lib, context, ref, dict, gray, ["SMask", "Decode"]);
+  dropMask(context, image);
   return true;
+}
+
+/** Aplana la transparencia de una imagen sin pérdida sobre blanco, sin cambiarle el color (RGB o gris). */
+function flattenImage(lib: PdfLib, context: PDFContextType, ref: PDFRefType): boolean {
+  const image = readFlateImage(lib, context, ref);
+  const stream = context.lookup(ref);
+  if (!image || !image.alpha || !(stream instanceof lib.PDFRawStream)) return false;
+  const flat = compositeOnWhite(image.pixels, image.alpha, image.channels);
+  replaceStream(lib, context, ref, stream.dict, flat, ["SMask"]);
+  dropMask(context, image);
+  return true;
+}
+
+/** Cada píxel sobre blanco según su alfa: lo transparente queda blanco, lo opaco queda igual. Sin pérdida (8 bits). */
+export function compositeOnWhite(pixels: Uint8Array, alpha: Uint8Array, channels: number): Uint8Array {
+  const out = new Uint8Array(pixels.length);
+  for (let j = 0; j < alpha.length; j += 1) {
+    const a = alpha[j]!;
+    for (let c = 0; c < channels; c += 1) {
+      const i = j * channels + c;
+      out[i] = a === 255 ? pixels[i]! : Math.round((pixels[i]! * a + 255 * (255 - a)) / 255);
+    }
+  }
+  return out;
+}
+
+/** RGB de 8 bits → gris por luminancia. */
+export function rgbToGray(pixels: Uint8Array): Uint8Array {
+  const gray = new Uint8Array(Math.floor(pixels.length / 3));
+  for (let i = 0, j = 0; j < gray.length; i += 3, j += 1) {
+    gray[j] = Math.round(0.299 * pixels[i]! + 0.587 * pixels[i + 1]! + 0.114 * pixels[i + 2]!);
+  }
+  return gray;
+}
+
+type FlateImage = { pixels: Uint8Array; channels: number; alpha: Uint8Array | null; maskRef: PDFRefType | null };
+
+/**
+ * Lee una imagen que se puede tocar sin riesgo: Flate, 8 bits, sin predictor, RGB o gris, y su transparencia
+ * (SMask) también así. Si algo no cuadra devuelve undefined y la imagen queda como estaba.
+ */
+function readFlateImage(lib: PdfLib, context: PDFContextType, ref: PDFRefType): FlateImage | undefined {
+  const stream = context.lookup(ref);
+  if (!(stream instanceof lib.PDFRawStream)) return undefined;
+  const dict = stream.dict;
+  if (nameOf(lib, context, dict.get(lib.PDFName.of("Filter"))) !== "FlateDecode") return undefined;
+  if (dict.get(lib.PDFName.of("DecodeParms")) || dict.get(lib.PDFName.of("Decode"))) return undefined;
+  const space = nameOf(lib, context, dict.get(lib.PDFName.of("ColorSpace")));
+  const channels = space === "DeviceRGB" ? 3 : space === "DeviceGray" ? 1 : 0;
+  if (!channels) return undefined;
+  if (numberOf(lib, context, dict.get(lib.PDFName.of("BitsPerComponent"))) !== 8) return undefined;
+  const width = numberOf(lib, context, dict.get(lib.PDFName.of("Width"))) ?? 0;
+  const height = numberOf(lib, context, dict.get(lib.PDFName.of("Height"))) ?? 0;
+  const pixels = lib.decodePDFRawStream(stream).decode();
+  if (pixels.length !== width * height * channels) return undefined;
+  const maskValue = dict.get(lib.PDFName.of("SMask"));
+  if (!maskValue) return { pixels, channels, alpha: null, maskRef: null };
+  if (!(maskValue instanceof lib.PDFRef)) return undefined;
+  const mask = context.lookup(maskValue);
+  if (!(mask instanceof lib.PDFRawStream)) return undefined;
+  const md = mask.dict;
+  if (nameOf(lib, context, md.get(lib.PDFName.of("Filter"))) !== "FlateDecode") return undefined;
+  if (md.get(lib.PDFName.of("DecodeParms")) || md.get(lib.PDFName.of("Matte"))) return undefined;
+  if (numberOf(lib, context, md.get(lib.PDFName.of("BitsPerComponent"))) !== 8) return undefined;
+  // pdf-lib escribe «Decode [0 1]», que es lo normal; un alfa invertido no se toca.
+  const decode = lookup(lib, context, md.get(lib.PDFName.of("Decode")));
+  if (decode instanceof lib.PDFArray) {
+    if (numberOf(lib, context, decode.get(0)) !== 0 || numberOf(lib, context, decode.get(1)) !== 1) return undefined;
+  } else if (decode) return undefined;
+  const alpha = lib.decodePDFRawStream(mask).decode();
+  if (alpha.length !== width * height) return undefined;
+  return { pixels, channels, alpha, maskRef: maskValue };
+}
+
+/** El alfa ya no lo usa nadie (pdf-lib arma uno por imagen): se borra para no dejarlo suelto en el archivo. */
+function dropMask(context: PDFContextType, image: FlateImage) {
+  if (image.maskRef) context.delete(image.maskRef);
 }
 
 function fontEmbedded(lib: PdfLib, context: PDFContextType, font: PDFDictType): boolean {
@@ -249,12 +362,21 @@ function wholeOpenTypeCff(lib: PdfLib, context: PDFContextType, font: PDFDictTyp
  * Deja el PDF listo para imprenta sin tocar el texto ni recomprimir fotos: neutros en gris, sin anotaciones y, en
  * blanco y negro, las imágenes sin pérdida pasadas a gris. Devuelve lo que impide declararlo PDF/X-1a.
  */
-function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean): string[] {
+function prepareForPress(
+  lib: PdfLib,
+  doc: PDFDocumentType,
+  grayscale: boolean,
+  flatten: boolean,
+  subset: boolean,
+): { problems: string[]; wholeOtf: boolean } {
   const context = doc.context;
   const missingFonts = new Set<string>();
   const wholeOtf = new Set<string>();
   const colorImages = new Set<number>();
+  const deepImages = new Set<number>();
+  const maskedImages = new Set<number>();
   let colorVectors = false;
+  let opacity = false;
   let transparency = false;
   const seenStreams = new Set<string>();
   const seenImages = new Set<string>();
@@ -276,7 +398,8 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
       if (!state) continue;
       for (const key of ["CA", "ca"]) {
         const alpha = numberOf(lib, context, state.get(lib.PDFName.of(key)));
-        if (alpha !== undefined && alpha < 1) transparency = true;
+        // La opacidad de CSS (jsafa la escribe así) no se aplana: solo se avisa.
+        if (alpha !== undefined && alpha < 1) opacity = true;
       }
       const softMask = state.get(lib.PDFName.of("SMask"));
       if (softMask && nameOf(lib, context, softMask) !== "None") transparency = true;
@@ -292,11 +415,15 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
         if (seenImages.has(key)) continue;
         seenImages.add(key);
         if (grayscale) imageToGray(lib, context, value);
+        if (flatten) flattenImage(lib, context, value);
         const image = context.lookup(value);
         if (!(image instanceof lib.PDFRawStream)) continue;
         const space = nameOf(lib, context, image.dict.get(lib.PDFName.of("ColorSpace")));
         if (space !== "DeviceGray" && space !== "DeviceCMYK") colorImages.add(pageNumber);
-        if (image.dict.get(lib.PDFName.of("SMask"))) transparency = true;
+        // Hoy jsafa escribe siempre 8 bits (los PNG pasan por RGBA de 8 bits); se revisa por si eso cambia.
+        const bits = numberOf(lib, context, image.dict.get(lib.PDFName.of("BitsPerComponent")));
+        if (bits !== undefined && bits > 8) deepImages.add(pageNumber);
+        if (image.dict.get(lib.PDFName.of("SMask"))) maskedImages.add(pageNumber);
       } else if (subtype === "Form" && !seenStreams.has(key)) {
         seenStreams.add(key);
         if (stream.dict.get(lib.PDFName.of("Group"))) transparency = true;
@@ -326,12 +453,15 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
     );
   }
   if (wholeOtf.size) {
+    const names = [...wholeOtf].join(", ");
     problems.push(
-      `Fuentes OpenType (OTF) incrustadas enteras: ${[...wholeOtf].join(", ")}. Así no cumplen PDF/X: apagá «Incrustar la fuente entera».`,
+      subset
+        ? `Fuentes OpenType (OTF) que no se pudieron recortar y quedaron enteras: ${names}. Así no cumplen PDF/X: probá con la versión TTF de esas fuentes.`
+        : `Fuentes OpenType (OTF) incrustadas enteras: ${names}. Así no cumplen PDF/X: apagá «Incrustar la fuente entera».`,
     );
   }
   if (colorImages.size) {
-    const pages = [...colorImages].slice(0, 12).join(", ") + (colorImages.size > 12 ? "…" : "");
+    const pages = pageList(colorImages);
     problems.push(
       grayscale
         ? `Hay imágenes en color que no se pueden pasar a gris sin recomprimirlas (JPEG en color), en las páginas ${pages}. Pasalas a escala de grises en el Word.`
@@ -339,8 +469,28 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
     );
   }
   if (colorVectors) problems.push("Hay texto o filetes en color.");
-  if (transparency) problems.push("Hay transparencias (por ejemplo un PNG con fondo transparente), que PDF/X-1a no admite.");
-  return problems;
+  if (deepImages.size) {
+    problems.push(
+      `Hay imágenes de 16 bits por color (páginas ${pageList(deepImages)}), que PDF/X-1a no admite. Guardalas en 8 bits antes de ponerlas en el Word.`,
+    );
+  }
+  if (maskedImages.size) {
+    problems.push(
+      flatten
+        ? `Hay imágenes con transparencia que no se pudieron poner sobre blanco sin recomprimirlas (páginas ${pageList(maskedImages)}). Ponelas sobre fondo blanco en el Word.`
+        : `Hay imágenes con transparencia, por ejemplo un PNG con fondo transparente (páginas ${pageList(maskedImages)}), que PDF/X-1a no admite.`,
+    );
+  }
+  if (opacity) {
+    problems.push("Hay texto, filetes o imágenes semitransparentes (con opacidad), que PDF/X-1a no admite. Dejalos opacos en el Word.");
+  }
+  if (transparency) problems.push("Hay transparencias (máscaras o grupos transparentes), que PDF/X-1a no admite.");
+  return { problems, wholeOtf: wholeOtf.size > 0 };
+}
+
+/** Las primeras 12 páginas de la lista, para el aviso. */
+function pageList(pages: Set<number>): string {
+  return [...pages].slice(0, 12).join(", ") + (pages.size > 12 ? "…" : "");
 }
 
 function declarePdfX1a(lib: PdfLib, doc: PDFDocumentType, title: string) {
