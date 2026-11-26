@@ -31,7 +31,7 @@ export function sniffImage(bytes: Uint8Array): ImageFormat {
   if ((bytes[0] === 1 || bytes[0] === 2) && bytes[1] === 0 && bytes[2] === 9 && bytes[3] === 0) return "wmf";
   if (bytes[0] === 0x1f && bytes[1] === 0x8b) return "comprimido";
   if (ascii(bytes, 0, 2) === "BM") return "bmp";
-  const head = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 512)).replace(/^﻿/, "").trimStart();
+  const head = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 512)).replace(/^\uFEFF/, "").trimStart();
   if (/^(<\?xml[\s\S]*?)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE svg[^>]*>\s*)?<svg\b/i.test(head)) return "svg";
   return "desconocido";
 }

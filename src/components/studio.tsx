@@ -13,10 +13,24 @@ import {
 import { cleanDocx, type CleanOptions, type CleanReport } from "@/lib/prepress/clean-docx";
 import { fontKey } from "@/lib/prepress/font-face";
 import { forgetFace, installFontFaces, loadShelf, readFontFile, rememberFace, registerShelfFonts, type ShelfFace } from "@/lib/prepress/font-shelf";
-import { installSubstitutes, loadSubstituteFaces, SUBSTITUTE_FACES } from "@/lib/prepress/substitutes";
+import {
+  embeddedFonts,
+  embeddedSkips,
+  faceKey,
+  installSubstitutes,
+  loadSubstituteFaces,
+  missingFaces,
+  SUBSTITUTE_FACES,
+  type EmbeddedFace,
+  type MissingFace,
+} from "@/lib/prepress/substitutes";
 import { exportPagesToPdf } from "@/lib/prepress/export-pdf";
 import { markPageFields } from "@/lib/prepress/fields";
-import { numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
+import { applyLayout, numberFootnotes, numberPages, repaginate, takeMarks } from "@/lib/prepress/paginate";
+import { DEFAULT_RENDER_INFO, prepareRenderCopy, type RenderInfo } from "@/lib/prepress/render-copy";
+import { fixCroppedImages, prepareForExport } from "@/lib/prepress/prepare-export";
+import { auditDocx, auditRenderedImages, type RenderedImage } from "@/lib/prepress/image-audit";
+import { FontMetricsCache, fillLastColumns, fixLineSpacing, HYPHENATION_WARNING } from "@/lib/prepress/line-spacing";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -87,6 +101,8 @@ export function Studio() {
   const cleanedRef = useRef<Uint8Array | null>(null);
   const sourceRef = useRef<Uint8Array | null>(null);
   const nameRef = useRef("documento.docx");
+  const embeddedRef = useRef<EmbeddedFace[]>([]);
+  const renderInfoRef = useRef<RenderInfo>(DEFAULT_RENDER_INFO);
 
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<"idle" | "working" | "ready" | "error">("idle");
@@ -108,10 +124,14 @@ export function Studio() {
   const substitutesRef = useRef(true);
   const [cropMarks, setCropMarks] = useState(false);
   const [grayscale, setGrayscale] = useState(false);
-  const [press, setPress] = useState<{ pdfx: boolean; problems: string[] } | null>(null);
+  const [bleed, setBleed] = useState(false);
+  const [press, setPress] = useState<{ pdfx: boolean; problems: string[]; notes: string[] } | null>(null);
+  const [docWarnings, setDocWarnings] = useState<string[]>([]);
+  const [layoutWarnings, setLayoutWarnings] = useState<string[]>([]);
+  const [missing, setMissing] = useState<MissingFace[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [shelf, setShelf] = useState<ShelfFace[]>([]);
-  const [imageChecks, setImageChecks] = useState<Array<{ label: string; ppi: number; pixels: string }>>([]);
+  const [imageChecks, setImageChecks] = useState<RenderedImage[]>([]);
   const [pageMm, setPageMm] = useState("");
   const [tooTall, setTooTall] = useState<number[]>([]);
 
@@ -166,10 +186,13 @@ export function Studio() {
 
   async function compose(bytes: Uint8Array, clean: CleanOptions) {
     setStatus("Componiendo las páginas");
-    installSubstitutes(substitutesRef.current);
+    // Si el Word trae su propia fuente incrustada, va esa; la sustituta solo completa las caras que falten.
+    const usable = embeddedRef.current.filter((face) => !face.restricted);
+    const skip = embeddedSkips(usable);
+    installSubstitutes(substitutesRef.current, skip);
     const aliases = fontAliases(shelfRef.current, reportRef.current);
     installFontFaces(shelfRef.current, aliases);
-    if (substitutesRef.current) await loadSubstituteFaces();
+    if (substitutesRef.current) await loadSubstituteFaces(skip);
     if ("fonts" in document) {
       const families = new Set<string>(aliases.map((item) => item.family));
       for (const face of shelfRef.current) families.add(face.family);
@@ -188,9 +211,13 @@ export function Studio() {
     if (!body || !style) throw new Error("No está el visor.");
     body.replaceChildren();
     style.replaceChildren();
+    // Se compone a tamaño real: el visor mide las tabulaciones mientras dibuja y con la vista achicada saldrían corridas.
+    flushSync(() => setScale(1));
     // Copia solo para componer: los números de página se escriben después, página por página.
     const marked = await markPageFields(bytes);
-    await renderAsync(marked.bytes, body, style, {
+    const prepared = await prepareRenderCopy(marked.bytes);
+    renderInfoRef.current = prepared.info;
+    await renderAsync(prepared.bytes, body, style, {
       className: "docx",
       inWrapper: true,
       breakPages: true,
@@ -204,25 +231,30 @@ export function Studio() {
       useBase64URL: false,
       experimental: true,
     });
-    const covered = new Set<string>();
-    if (substitutesRef.current) {
-      for (const face of SUBSTITUTE_FACES) covered.add(face.family.toLowerCase());
-    }
-    for (const face of shelfRef.current) covered.add(face.family.toLowerCase());
-    for (const alias of aliases) covered.add(alias.family.toLowerCase());
-    // Solo se quitan las fuentes incrustadas (@font-face) que la app reemplaza. Los demás bloques son los estilos,
-    // el tema y la numeración del Word: si se borran, el documento pierde su letra, sus tamaños y sus sangrías.
+    // Las fuentes subidas ganan a las incrustadas en el Word; las incrustadas con licencia que no permite incrustarlas
+    // no se usan. Solo se quitan esos @font-face: los demás bloques son los estilos, el tema y la numeración del Word
+    // (si se borran, el documento pierde su letra, sus tamaños y sus sangrías).
+    const uploaded = new Set<string>();
+    for (const face of shelfRef.current) uploaded.add(face.family.toLowerCase());
+    for (const alias of aliases) uploaded.add(alias.family.toLowerCase());
+    const restricted = new Set(
+      embeddedRef.current.filter((face) => face.restricted).map((face) => faceKey(face.family, face.weight, face.style)),
+    );
     for (const node of [...style.querySelectorAll("style")]) {
       const css = (node.textContent ?? "").trim();
       if (!/^@font-face/i.test(css)) continue;
-      const family = /font-family:\s*([^;}]+)/i.exec(css)?.[1]?.trim().replace(/^['"]+|['"]+$/g, "").toLowerCase();
-      if (family && covered.has(family)) node.remove();
+      const family = /font-family:\s*([^;}]+)/i.exec(css)?.[1]?.trim().replace(/^['"]+|['"]+$/g, "") ?? "";
+      const weight = /font-weight:\s*bold/i.test(css) ? 700 : 400;
+      const italic = /font-style:\s*italic/i.test(css) ? "italic" : "normal";
+      if (uploaded.has(family.toLowerCase()) || restricted.has(faceKey(family, weight, italic))) node.remove();
     }
+    const covered = new Set<string>(uploaded);
+    if (substitutesRef.current) for (const face of SUBSTITUTE_FACES) covered.add(face.family.toLowerCase());
     for (const id of ["pliego-substitutes", "pliego-uploaded-fonts"]) {
       const tag = document.getElementById(id);
       if (tag) document.head.appendChild(tag);
     }
-    if (substitutesRef.current) await loadSubstituteFaces();
+    if (substitutesRef.current) await loadSubstituteFaces(skip);
     if ("fonts" in document && covered.size > 0) {
       await Promise.all(
         [...covered].map((family) => document.fonts.load(`16px "${family}"`).catch(() => undefined)),
@@ -250,10 +282,37 @@ export function Studio() {
       );
       await document.fonts.ready;
     }
+    // Interlineado como en Word (alto natural de cada letra), antes de cortar las páginas.
+    const metrics = new FontMetricsCache();
+    for (const face of shelfRef.current) metrics.addBytes(face.family, face.bytes, face);
+    for (const alias of aliases) metrics.addBytes(alias.family, alias.face.bytes, alias.face);
+    for (const face of usable) metrics.addBytes(face.family, face.bytes, face);
+    if (substitutesRef.current) for (const face of SUBSTITUTE_FACES) metrics.addUrl(face.family, face.file, face);
+    const spacing = await fixLineSpacing(body, { metrics: metrics.metrics, spacing: prepared.info.spacing, className: "docx" });
     const map = takeMarks(body);
-    const flow = repaginate(body, map);
+    repaginate(body, map);
+    const layout = applyLayout(body, map, prepared.info, marked.sections);
+    numberFootnotes(body, prepared.info, map);
     numberPages(body, marked.sections, map);
-    setTooTall(flow.tooTall);
+    fillLastColumns(body, (_article, page) => {
+      // La última página de una sección seguida de un salto continuo queda equilibrada, como en Word.
+      const section = map.section.get(page) ?? 0;
+      const next = page.nextElementSibling as HTMLElement | null;
+      const nextSection = next ? map.section.get(next) : undefined;
+      return nextSection !== section && prepared.info.sections[section + 1]?.type === "continuous";
+    });
+    fixCroppedImages(body);
+    setTooTall(layout.tooTall);
+    const notices = [...prepared.warnings, ...spacing.warnings, ...layout.warnings];
+    if (layout.blanks > 0) {
+      notices.push(
+        layout.blanks === 1
+          ? "Se agregó 1 página en blanco para que un capítulo empiece en página impar o par, como pide el Word."
+          : `Se agregaron ${layout.blanks} páginas en blanco para que los capítulos empiecen en página impar o par, como pide el Word.`,
+      );
+    }
+    if (prepared.info.autoHyphenation) notices.push(HYPHENATION_WARNING);
+    setLayoutWarnings([...new Set(notices)]);
     const pages = body.querySelectorAll("section.docx").length;
     setPageCount(pages);
     const first = body.querySelector("section.docx") as HTMLElement | null;
@@ -262,18 +321,8 @@ export function Studio() {
       const height = Math.round((first.offsetHeight / 96) * 25.4);
       setPageMm(`${width} × ${height} mm`);
     }
-    setImageChecks(
-      [...body.querySelectorAll("section.docx img")].map((node, index) => {
-        const img = node as HTMLImageElement;
-        const inches = img.clientWidth / 96;
-        const ppi = inches > 0 ? Math.round(img.naturalWidth / inches) : 0;
-        return {
-          label: img.alt || `Imagen ${index + 1}`,
-          ppi,
-          pixels: `${img.naturalWidth}×${img.naturalHeight}`,
-        };
-      }),
-    );
+    setImageChecks(await auditRenderedImages(body));
+    setMissing(missingFaces(body));
     requestAnimationFrame(measure);
   }
 
@@ -281,6 +330,8 @@ export function Studio() {
     setPhase("working");
     setError("");
     setPress(null);
+    setDocWarnings([]);
+    setLayoutWarnings([]);
     setStatus("Leyendo el Word");
     nameRef.current = filename;
     setName(filename);
@@ -292,6 +343,10 @@ export function Studio() {
       setStatus("Quitando marcas y comentarios");
       const result = await cleanDocx(input, clean);
       cleanedRef.current = result.bytes;
+      // Solo se lee el Word limpio: avisos de imágenes, gráficos y formas, y las fuentes que trae incrustadas.
+      const [audit, fonts] = await Promise.all([auditDocx(result.bytes), embeddedFonts(result.bytes)]);
+      embeddedRef.current = fonts.faces;
+      setDocWarnings([...audit, ...fonts.warnings]);
       reportRef.current = result.report;
       setReport(result.report);
       await compose(result.bytes, clean);
@@ -436,24 +491,29 @@ export function Studio() {
     // Sin el fondo de «papel» ni la sombra de la pantalla: en el PDF la hoja es blanca, sin un rectángulo crema.
     doc.classList.add("pliego-exporting");
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    let restore = () => {};
     try {
+      // Lo que el PDF no ve (números de lista, versalitas, subrayados, guiones de corte…) pasa a texto y cajas.
+      const notes: string[] = [];
+      restore = prepareForExport(doc, { autoHyphenation: renderInfoRef.current.autoHyphenation, warnings: notes });
       const sections = [...doc.querySelectorAll("section.docx")] as HTMLElement[];
-      await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current));
+      await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current), embeddedRef.current);
+      const base = { title: stem(nameRef.current), cropMarks, grayscale, bleed, flatten: true };
       let result: Awaited<ReturnType<typeof exportPagesToPdf>>;
       try {
-        result = await exportPagesToPdf(sections, {
-          title: stem(nameRef.current),
-          subset: !fullFont,
-          cropMarks,
-          grayscale,
-        });
+        result = await exportPagesToPdf(sections, { ...base, subset: !fullFont });
       } catch (err) {
         if (!fullFont) throw err;
-        result = await exportPagesToPdf(sections, { title: stem(nameRef.current), subset: true, cropMarks, grayscale });
+        result = await exportPagesToPdf(sections, { ...base, subset: true });
         setFullFont(false);
         setError("Esa fuente no permite incrustarse entera. Se incrustó el subconjunto usado.");
       }
-      setPress({ pdfx: result.pdfx, problems: result.problems });
+      if (result.needsSubset) {
+        result = await exportPagesToPdf(sections, { ...base, subset: true });
+        setFullFont(false);
+        setError("Una fuente OpenType (OTF) no puede ir entera en PDF/X: se incrustó solo lo que usa el libro.");
+      }
+      setPress({ pdfx: result.pdfx, problems: result.problems, notes });
       saveBytes(result.bytes, `${stem(nameRef.current)}.pdf`, "application/pdf");
       setStatus("");
     } catch (err) {
@@ -464,6 +524,7 @@ export function Studio() {
       );
       setStatus("");
     } finally {
+      restore();
       doc.classList.remove("pliego-exporting");
       flushSync(() => setFit(previousFit));
       requestAnimationFrame(measure);
@@ -596,10 +657,16 @@ export function Studio() {
               hint="Para IngramSpark / Lightning Source en B/N: las imágenes PNG pasan a escala de grises sin perder calidad y el PDF sale PDF/X-1a. Los JPEG no se tocan."
             />
             <Toggle
+              pressed={bleed}
+              onClick={() => setBleed((value) => !value)}
+              label="Sangrado (0,125 pulgadas)"
+              hint="Agranda la hoja 3 mm arriba, abajo y del lado de afuera, como pide Lightning Source para lo que llega al borde. Sale en blanco salvo que la imagen o el fondo toquen el borde de la página en el Word."
+            />
+            <Toggle
               pressed={substitutes}
               onClick={() => void toggleSubstitutes()}
               label="Completar las fuentes"
-              hint="Encendido. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app. El PDF incrusta ese archivo completo, no el recorte del Word."
+              hint="Encendido. Calibri, Cambria, Arial, Times, Courier, Tahoma, Candara, MS Gothic, Symbol y Wingdings ya están en la app. Si el Word trae su propia fuente incrustada se usa esa, y la de la app solo completa las variantes que falten."
             />
             <Toggle
               pressed={fullFont}
@@ -633,13 +700,18 @@ export function Studio() {
                     fontAliases([face], report).some((alias) => alias.family === font.name),
                   );
                   const covered = uploaded.length > 0 || (substitutes && Boolean(font.substitute));
+                  const inWord = embeddedRef.current.filter((face) => fontKey(face.family) === fontKey(font.name) && !face.restricted);
                   const status = uploaded.length
                     ? `subida · ${uploaded.map(faceLabel).join(", ")} · entera en el PDF`
-                    : substitutes && font.substitute
-                      ? "ya está en la app"
-                      : font.embedded
-                        ? "recorte del Word"
-                        : "falta · súbela";
+                    : inWord.length
+                      ? inWord.some((face) => face.subsetted)
+                        ? "incrustada en el Word (solo las letras usadas)"
+                        : "incrustada en el Word"
+                      : substitutes && font.substitute
+                        ? "ya está en la app"
+                        : font.embedded
+                          ? "recorte del Word"
+                          : "falta · súbela";
                   return (
                     <li key={font.name} className="flex items-baseline justify-between gap-3">
                       <span className="text-fg">{font.name}</span>
@@ -691,23 +763,53 @@ export function Studio() {
             </ul>
           ) : null}
 
+          {missing.length > 0 ? (
+            <div className="grid gap-1 text-sm">
+              <p className="font-semibold">Variantes de letra que faltan</p>
+              <p className="text-muted">
+                Se usan en el texto y no hay un archivo de fuente para ellas: el PDF las haría con otra letra (sin
+                negrita o sin cursiva de verdad). Subí esos archivos.
+              </p>
+              <ul className="grid gap-1">
+                {missing.map((face) => (
+                  <li key={face.label} className={"flex items-baseline justify-between gap-3 " + (face.familyMissing ? "text-accent" : "text-muted")}>
+                    <span className="text-fg">{face.label}</span>
+                    <span className="text-right">
+                      {face.chars} letras · «{face.sample}»
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => fontRef.current?.click()}
+                className="rounded-lg border border-accent px-3 py-2.5 text-sm font-semibold text-fg disabled:opacity-40"
+              >
+                Subir las que faltan
+              </button>
+            </div>
+          ) : null}
+
           {imageChecks.length > 0 ? (
             <ul className="grid gap-1 text-sm text-muted">
               {imageChecks.map((image) => (
-                <li key={`${image.label}-${image.pixels}`} className="flex items-baseline justify-between gap-3">
-                  <span className="text-fg">{image.pixels}</span>
-                  <span className={image.ppi > 0 && image.ppi < 300 ? "text-accent" : ""}>
-                    {image.ppi > 0 ? `${image.ppi} ppp` : "sin medida"}
-                    {image.ppi > 0 && image.ppi < 300 ? " · baja para offset" : " · sin recomprimir"}
+                <li key={`${image.label}-${image.page}-${image.pixels}`} className="flex items-baseline justify-between gap-3">
+                  <span className="text-fg">
+                    {image.pixels} · pág. {image.page}
+                  </span>
+                  <span className={image.level !== "ok" ? "text-right text-accent" : "text-right"}>
+                    {image.ppi > 0 ? `${image.ppi} ppp · ` : ""}
+                    {image.note}
                   </span>
                 </li>
               ))}
             </ul>
           ) : null}
 
-          {report?.warnings.length ? (
+          {(report?.warnings.length ?? 0) + docWarnings.length + layoutWarnings.length > 0 ? (
             <ul className="grid gap-2">
-              {report.warnings.map((warning) => (
+              {[...new Set([...(report?.warnings ?? []), ...docWarnings, ...layoutWarnings])].map((warning) => (
                 <li key={warning} className="flex gap-2 text-sm text-accent">
                   <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
                   <span>{warning}</span>
@@ -729,9 +831,14 @@ export function Studio() {
 
           {press ? (
             press.pdfx ? (
-              <p className="text-sm text-muted">
-                El último PDF salió PDF/X-1a:2001: tamaño de corte declarado, fuentes incrustadas y todo en gris.
-              </p>
+              <div className="grid gap-1 text-sm text-muted">
+                <p>El último PDF salió PDF/X-1a:2001: tamaño de corte declarado, fuentes incrustadas y todo en gris.</p>
+                {press.notes.map((note) => (
+                  <p key={note} className="text-accent">
+                    {note}
+                  </p>
+                ))}
+              </div>
             ) : (
               <div className="grid gap-1 text-sm text-accent">
                 <p className="flex gap-2">
@@ -739,7 +846,7 @@ export function Studio() {
                   <span>El último PDF no es PDF/X-1a. Lo que falta:</span>
                 </p>
                 <ul className="grid list-disc gap-1 pl-6">
-                  {press.problems.map((problem) => (
+                  {[...press.problems, ...press.notes].map((problem) => (
                     <li key={problem}>{problem}</li>
                   ))}
                 </ul>

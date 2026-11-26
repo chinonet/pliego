@@ -6,6 +6,7 @@ import type {
   PDFPage as PDFPageType,
   PDFRef as PDFRefType,
 } from "pdf-lib";
+import { clipCroppedImages } from "./prepare-export.ts";
 
 export type PdfExport = {
   bytes: Uint8Array;
@@ -44,7 +45,7 @@ export async function exportPagesToPdf(
   sections: HTMLElement[],
   opts: ExportOptions,
 ): Promise<PdfExport> {
-  const { toPdf } = await import("jsafa-pdf");
+  const jsafa = await import("jsafa-pdf");
   const lib = await import("pdf-lib");
   const { PDFDocument, grayscale } = lib;
 
@@ -57,12 +58,13 @@ export async function exportPagesToPdf(
 
   let pageIndex = 0;
   for (const section of sections) {
-    const bytes = await toPdf(section, {
-      subset: opts.subset,
-      title: opts.title,
-      autoFonts: true,
-      waitForAssets: true,
-    });
+    // Lo mismo que toPdf, pero con el paso intermedio a mano para recortar las imágenes recortadas en el Word
+    // (jsafa no aplica el clip-path del visor y las sacaría enteras).
+    await jsafa.waitForAssets(section);
+    await jsafa.registerFontsFromCss(section.ownerDocument);
+    const captured = jsafa.captureElement(section);
+    clipCroppedImages(captured);
+    const bytes = await jsafa.emitPdf(captured, { subset: opts.subset, title: opts.title });
     const part = await PDFDocument.load(bytes);
     const copied = await merged.copyPages(part, part.getPageIndices());
     for (const page of copied) {

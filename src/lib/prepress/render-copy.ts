@@ -7,6 +7,7 @@ import {
   type Node as XmlNode,
 } from "@xmldom/xmldom";
 import { FOOTNOTE_MARK, MARK_CLOSE, MARK_OPEN } from "./fields.ts";
+import { EMPTY_SPACING, prepareLineSpacing, type SpacingInfo } from "./line-spacing.ts";
 
 /**
  * Ajustes del .docx que solo sirven para componer (la copia que ve el visor, nunca el Word que se descarga) y datos del
@@ -34,6 +35,8 @@ export type RenderInfo = {
   footnoteStart: number;
   /** Una entrada por sección, en el mismo orden que SectionNumbering de fields.ts. */
   sections: SectionLayout[];
+  /** Interlineado y «sin espacio entre párrafos del mismo estilo», para la composición (line-spacing.ts). */
+  spacing: SpacingInfo;
 };
 
 export const DEFAULT_RENDER_INFO: RenderInfo = {
@@ -43,6 +46,7 @@ export const DEFAULT_RENDER_INFO: RenderInfo = {
   footnoteRestart: "continuous",
   footnoteStart: 1,
   sections: [],
+  spacing: EMPTY_SPACING,
 };
 
 /**
@@ -128,7 +132,7 @@ function make(doc: XmlDocument, ns: string, name: string, attrs: Record<string, 
 
 function parse(xml: string): XmlDocument | null {
   try {
-    const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml.replace(/^﻿/, ""), "text/xml");
+    const doc = new DOMParser({ onError: () => undefined }).parseFromString(xml.replace(/^\uFEFF/, ""), "text/xml");
     return doc.getElementsByTagName("parsererror").length ? null : doc;
   } catch {
     return null;
@@ -626,6 +630,10 @@ export async function prepareRenderCopy(
     warnings.push(...warningsFor(WHERE.find(([pattern]) => pattern.test(name))![1], found));
     zip.file(name, serialize(doc));
   }
+
+  const spacing = await prepareLineSpacing(zip);
+  info.spacing = spacing.spacing;
+  warnings.push(...spacing.warnings);
 
   // STORE: es una copia para el visor; las imágenes pasan igual.
   const out = await zip.generateAsync({ type: "uint8array", compression: "STORE" });
