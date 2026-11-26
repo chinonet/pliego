@@ -85,9 +85,15 @@ assert.deepEqual(splitInvisible("pa\u00ADla\u200Bbra"), ["pa", "\u00AD", "la", "
 assert.deepEqual(splitInvisible("nada"), ["nada"]);
 
 // Recortes del Word como los deja el visor.
-assert.deepEqual(parseCrop("rect(10.00% 70.00% 95.00% 5.00%)"), { top: 0.1, right: 0.3, bottom: 0.05, left: 0.05 });
-assert.deepEqual(parseCrop("inset(10% 30% 5% 5%)"), { top: 0.1, right: 0.3, bottom: 0.05, left: 0.05 });
-assert.deepEqual(parseCrop("inset(10%)"), { top: 0.1, right: 0.1, bottom: 0.1, left: 0.1 });
+const nearCrop = (actual: ReturnType<typeof parseCrop>, expected: Record<string, number>) => {
+  assert.ok(actual, "hay recorte");
+  for (const key of Object.keys(expected)) {
+    assert.ok(Math.abs((actual as Record<string, number>)[key]! - expected[key]!) < 1e-9, `${key}: ${(actual as Record<string, number>)[key]}`);
+  }
+};
+nearCrop(parseCrop("rect(10.00% 70.00% 95.00% 5.00%)"), { top: 0.1, right: 0.3, bottom: 0.05, left: 0.05 });
+nearCrop(parseCrop("inset(10% 30% 5% 5%)"), { top: 0.1, right: 0.3, bottom: 0.05, left: 0.05 });
+nearCrop(parseCrop("inset(10%)"), { top: 0.1, right: 0.1, bottom: 0.1, left: 0.1 });
 assert.equal(parseCrop("rect(0.00% 100.00% 100.00% 0.00%)"), null, "sin recorte");
 assert.equal(parseCrop("none"), null);
 assert.equal(parseCrop("circle(50%)"), null);
