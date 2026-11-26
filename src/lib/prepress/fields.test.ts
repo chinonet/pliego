@@ -41,7 +41,7 @@ const footer = await out.file("word/footer1.xml")!.async("string");
 const body = await out.file("word/document.xml")!.async("string");
 
 assert.equal(marked.fields, 5, "dos PAGE, un PAGE romano, NUMPAGES y SECTIONPAGES");
-assert.ok(footer.includes(pageMark("lowerRoman")), "el formato del campo (\* roman) viaja en la marca");
+assert.ok(footer.includes(pageMark("lowerRoman")), "el formato del campo (roman) viaja en la marca");
 assert.ok(footer.includes(SECTION_PAGES_MARK), "SECTIONPAGES tiene su propia marca");
 assert.equal(footer.split(PAGE_MARK).length - 1, 2, "cada PAGE queda como una marca");
 assert.ok(footer.includes(PAGES_MARK), "NUMPAGES queda como marca");
