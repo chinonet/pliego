@@ -4,6 +4,7 @@ import {
   cropMatrix,
   cropTransform,
   formatCounter,
+  markerPieces,
   markerText,
   pagesText,
   parseContent,
@@ -36,6 +37,9 @@ const counters = new Map([
   ["docx-num-1-1", 4],
 ]);
 assert.equal(contentText(parts!, counters), "3.iv\t");
+assert.deepEqual(markerPieces("3.iv\t"), ["3.iv", "\t"], "el tabulador del número va en su propio trozo");
+assert.deepEqual(markerPieces("\t"), ["", "\t"]);
+assert.deepEqual(markerPieces("1. "), ["1.", " "]);
 assert.equal(parseContent("none"), null);
 assert.equal(parseContent("normal"), null);
 assert.equal(parseContent("attr(title)"), null, "lo que no se resuelve no se inventa");
@@ -68,6 +72,8 @@ assert.equal(transformCase("ÁRBOL", "lowercase"), "árbol");
 assert.equal(transformCase("el árbol viejo", "capitalize"), "El Árbol Viejo");
 assert.equal(transformCase("bol viejo", "capitalize", "ár"), "bol Viejo", "la palabra empezó en el nodo anterior");
 assert.equal(transformCase(" casa", "capitalize", "la"), " Casa");
+assert.equal(transformCase("el árbol", "capitalize", "", "x-none"), "El Árbol", "un idioma que no existe no corta el paso");
+assert.equal(transformCase("árbol", "uppercase", "", "x-none"), "ÁRBOL");
 
 // Versalitas: minúsculas a mayúsculas chicas, las mayúsculas y los signos quedan.
 assert.deepEqual(splitSmallCaps("Hola, Mundo 2"), [
