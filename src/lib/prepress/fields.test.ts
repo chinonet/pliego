@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import JSZip from "jszip";
 import { markPageFields, PAGE_MARK, PAGES_MARK, sectionMark } from "./fields.ts";
 import { formatPageNumber } from "./paginate.ts";
-import { neutralToGray } from "./export-pdf.ts";
+import { allToGray, neutralToGray } from "./export-pdf.ts";
 
 const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
 const docXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -59,5 +59,8 @@ assert.equal(neutralToGray("BT\n0 0 0 rg\n/F1 12 Tf"), "BT\n0 g\n/F1 12 Tf");
 assert.equal(neutralToGray("0.2 0.2 0.2 RG 1 w"), "0.2 G 1 w");
 assert.equal(neutralToGray("1 0 0 rg"), "1 0 0 rg", "un color de verdad no se toca");
 assert.equal(neutralToGray("10 0 0 10 0 0 cm 0 0 0 rg"), "10 0 0 10 0 0 cm 0 g", "solo los operandos de rg");
+
+assert.equal(allToGray("0 0 1 rg (enlace) Tj"), "0.114 g (enlace) Tj", "en B/N el azul pasa a su gris");
+assert.equal(allToGray("1 0 0 RG 0 0 0 rg"), "0.299 G 0 g");
 
 console.log("fields ok");

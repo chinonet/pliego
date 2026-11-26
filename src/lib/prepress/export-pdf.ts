@@ -59,14 +59,16 @@ export async function exportPagesToPdf(
   }
 
   const problems = prepareForPress(lib, merged, Boolean(opts.grayscale));
+  shareFontPrograms(lib, merged);
   const pdfx = problems.length === 0;
   if (pdfx) declarePdfX1a(lib, merged, opts.title);
-  else merged.context.header = lib.PDFHeader.forVersion(1, 4);
   const id = lib.PDFHexString.of(fileId(opts.title));
   merged.context.trailerInfo.ID = merged.context.obj([id, id]);
   infoDict(lib, merged).set(lib.PDFName.of("Trapped"), lib.PDFName.of("False"));
 
   const bytes = await merged.save({ useObjectStreams: false });
+  // pdf-lib siempre escribe «%PDF-1.7»; PDF/X-1a:2001 pide 1.3. Mismo largo: no se corre ningún desplazamiento.
+  setHeaderVersion(bytes, pdfx ? "1.3" : "1.4");
   return { bytes, pdfx, problems };
 }
 
@@ -107,9 +109,18 @@ const NUMBER = String.raw`-?(?:\d+\.?\d*|\.\d+)`;
 const NEUTRAL_FILL = new RegExp(String.raw`(^|\s)(${NUMBER})\s+\2\s+\2\s+rg(?=\s|$)`, "g");
 const NEUTRAL_STROKE = new RegExp(String.raw`(^|\s)(${NUMBER})\s+\2\s+\2\s+RG(?=\s|$)`, "g");
 const COLOR_LEFT = /(^|\s)(rg|RG|scn?|SCN?)(?=\s|$)/;
+const ANY_RGB = new RegExp(String.raw`(^|\s)(${NUMBER})\s+(${NUMBER})\s+(${NUMBER})\s+(rg|RG)(?=\s|$)`, "g");
 
 export function neutralToGray(content: string): string {
   return content.replace(NEUTRAL_FILL, "$1$2 g").replace(NEUTRAL_STROKE, "$1$2 G");
+}
+
+/** Interior en blanco y negro: cualquier color RGB pasa a su gris (luminancia), como lo imprimiría la imprenta. */
+export function allToGray(content: string): string {
+  return neutralToGray(content).replace(ANY_RGB, (_, lead: string, r: string, g: string, b: string, op: string) => {
+    const y = 0.299 * Number(r) + 0.587 * Number(g) + 0.114 * Number(b);
+    return `${lead}${Number(y.toFixed(4))} ${op === "rg" ? "g" : "G"}`;
+  });
 }
 
 function lookup(lib: PdfLib, context: PDFContextType, value: PDFObjectType | undefined): PDFObjectType | undefined {
@@ -145,13 +156,13 @@ function replaceStream(lib: PdfLib, context: PDFContextType, ref: PDFRefType, di
 }
 
 /** Reescribe un stream de contenido con los neutros en gris. Devuelve si quedó algún color que no es gris. */
-function rewriteContent(lib: PdfLib, context: PDFContextType, ref: PDFRefType): boolean {
+function rewriteContent(lib: PdfLib, context: PDFContextType, ref: PDFRefType, grayscale: boolean): boolean {
   const stream = context.lookup(ref);
   if (!(stream instanceof lib.PDFRawStream)) return false;
   const raw = lib.decodePDFRawStream(stream).decode();
   let text = "";
   for (let i = 0; i < raw.length; i += 0x8000) text += String.fromCharCode(...raw.subarray(i, i + 0x8000));
-  const next = neutralToGray(text);
+  const next = grayscale ? allToGray(text) : neutralToGray(text);
   if (next !== text) {
     const bytes = new Uint8Array(next.length);
     for (let i = 0; i < next.length; i += 1) bytes[i] = next.charCodeAt(i) & 0xff;
@@ -269,7 +280,7 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
         seenStreams.add(key);
         if (stream.dict.get(lib.PDFName.of("Group"))) transparency = true;
         const resources = asDict(lib, context, stream.dict.get(lib.PDFName.of("Resources")));
-        if (rewriteContent(lib, context, value)) colorVectors = true;
+        if (rewriteContent(lib, context, value, grayscale)) colorVectors = true;
         walkResources(resources, pageNumber);
       }
     }
@@ -282,7 +293,7 @@ function prepareForPress(lib: PdfLib, doc: PDFDocumentType, grayscale: boolean):
       const key = ref.toString();
       if (seenStreams.has(key)) continue;
       seenStreams.add(key);
-      if (rewriteContent(lib, context, ref)) colorVectors = true;
+      if (rewriteContent(lib, context, ref, grayscale)) colorVectors = true;
     }
     walkResources(page.node.Resources(), index + 1);
   });
@@ -322,6 +333,54 @@ function declarePdfX1a(lib: PdfLib, doc: PDFDocumentType, title: string) {
   info.set(lib.PDFName.of("GTS_PDFXVersion"), lib.PDFString.of("PDF/X-1a:2001"));
   info.set(lib.PDFName.of("GTS_PDFXConformance"), lib.PDFString.of("PDF/X-1a:2001"));
   info.set(lib.PDFName.of("Title"), lib.PDFHexString.fromText(title));
+}
+
+function setHeaderVersion(bytes: Uint8Array, version: string) {
+  const want = `%PDF-${version}`;
+  const head = String.fromCharCode(...bytes.subarray(0, 8));
+  if (!/^%PDF-\d\.\d$/.test(head) || want.length !== 8) return;
+  for (let i = 0; i < 8; i += 1) bytes[i] = want.charCodeAt(i);
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Cada página se arma como un PDF aparte, así que la misma fuente entera viene una vez por página. Los programas de
+ * fuente idénticos (byte por byte) quedan uno solo, compartido: el archivo pesa mucho menos y nada cambia en lo impreso.
+ */
+function shareFontPrograms(lib: PdfLib, doc: PDFDocumentType) {
+  const context = doc.context;
+  const kept = new Map<string, Array<{ ref: PDFRefType; bytes: Uint8Array }>>();
+  const drop: PDFRefType[] = [];
+  for (const [, object] of context.enumerateIndirectObjects()) {
+    if (!(object instanceof lib.PDFDict)) continue;
+    if (nameOf(lib, context, object.get(lib.PDFName.of("Type"))) !== "FontDescriptor") continue;
+    for (const key of ["FontFile", "FontFile2", "FontFile3"]) {
+      const ref = object.get(lib.PDFName.of(key));
+      if (!(ref instanceof lib.PDFRef)) continue;
+      const stream = context.lookup(ref);
+      if (!(stream instanceof lib.PDFRawStream)) continue;
+      const bytes = stream.contents;
+      let hash = 2166136261;
+      const step = Math.max(1, Math.floor(bytes.length / 4096));
+      for (let i = 0; i < bytes.length; i += step) hash = Math.imul(hash ^ bytes[i]!, 16777619) >>> 0;
+      const bucketKey = `${bytes.length}:${hash}`;
+      const bucket = kept.get(bucketKey) ?? [];
+      const twin = bucket.find((item) => item.ref !== ref && sameBytes(item.bytes, bytes));
+      if (twin) {
+        object.set(lib.PDFName.of(key), twin.ref);
+        drop.push(ref);
+      } else if (!bucket.some((item) => item.ref === ref)) {
+        bucket.push({ ref, bytes });
+        kept.set(bucketKey, bucket);
+      }
+    }
+  }
+  for (const ref of drop) context.delete(ref);
 }
 
 /** El diccionario Info del archivo (título, fechas, datos PDF/X). */
