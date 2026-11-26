@@ -104,6 +104,8 @@ export function Studio() {
   const nameRef = useRef("documento.docx");
   const embeddedRef = useRef<EmbeddedFace[]>([]);
   const renderInfoRef = useRef<RenderInfo>(DEFAULT_RENDER_INFO);
+  // Mientras se compone, la vista queda a tamaño real (el visor mide tabulaciones y renglones en pantalla).
+  const composingRef = useRef(false);
 
   const [name, setName] = useState("");
   const [phase, setPhase] = useState<"idle" | "working" | "ready" | "error">("idle");
@@ -145,7 +147,7 @@ export function Studio() {
     const width = page.offsetWidth;
     const height = wrapper.offsetHeight;
     const avail = Math.max(frame.clientWidth - 48, 160);
-    const next = fit ? Math.min(1, avail / width) : 1;
+    const next = fit && !composingRef.current ? Math.min(1, avail / width) : 1;
     setSheet({ width, height });
     setScale(Number.isFinite(next) && next > 0 ? next : 1);
   }
@@ -186,6 +188,15 @@ export function Studio() {
   }, [fit, pageCount, phase]);
 
   async function compose(bytes: Uint8Array, clean: CleanOptions) {
+    try {
+      await composePages(bytes, clean);
+    } finally {
+      composingRef.current = false;
+      requestAnimationFrame(measure);
+    }
+  }
+
+  async function composePages(bytes: Uint8Array, clean: CleanOptions) {
     setStatus("Componiendo las páginas");
     // Si el Word trae su propia fuente incrustada, va esa; la sustituta solo completa las caras que falten.
     const usable = embeddedRef.current.filter((face) => !face.restricted);
@@ -213,6 +224,7 @@ export function Studio() {
     body.replaceChildren();
     style.replaceChildren();
     // Se compone a tamaño real: el visor mide las tabulaciones mientras dibuja y con la vista achicada saldrían corridas.
+    composingRef.current = true;
     flushSync(() => setScale(1));
     // Copia solo para componer: los números de página se escriben después, página por página.
     const marked = await markPageFields(bytes);
@@ -290,6 +302,9 @@ export function Studio() {
       );
       await document.fonts.ready;
     }
+    // El visor calcula el ancho de los tabuladores (índices con puntos, columnas con tabulador) medio segundo después de
+    // dibujar: hay que esperarlo a tamaño real antes de medir las páginas.
+    await new Promise((resolve) => setTimeout(resolve, 650));
     // Interlineado como en Word (alto natural de cada letra), antes de cortar las páginas.
     const metrics = new FontMetricsCache();
     for (const face of shelfRef.current) metrics.addBytes(face.family, face.bytes, face);
@@ -297,6 +312,10 @@ export function Studio() {
     for (const face of usable) metrics.addBytes(face.family, face.bytes, face);
     if (substitutesRef.current) for (const face of SUBSTITUTE_FACES) metrics.addUrl(face.family, face.file, face);
     const spacing = await fixLineSpacing(body, { metrics: metrics.metrics, spacing: prepared.info.spacing, className: "docx" });
+    // Un renglón que solo tiene una imagen: Word no suma interlineado debajo de la imagen.
+    for (const paragraph of body.querySelectorAll<HTMLElement>("section.docx p")) {
+      if (!paragraph.textContent?.trim() && paragraph.querySelector("img, svg")) paragraph.style.lineHeight = "normal";
+    }
     const map = takeMarks(body);
     repaginate(body, map);
     const layout = applyLayout(body, map, prepared.info, marked.sections);
