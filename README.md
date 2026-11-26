@@ -16,8 +16,10 @@ Convierte un Word (.docx) en un PDF para premedia, en el navegador.
 - Avisa lo que no puede pasar bien: imágenes EMF/WMF/TIFF, gráficos y SmartArt, cuadros de texto, fotos giradas o con
   otro perfil de color, variantes de letra que faltan, imágenes de poca resolución.
 - Para IngramSpark / Lightning Source: hoja exacta al corte, caja de corte declarada, sangrado opcional de 0,125",
-  negro en gris puro y, con «Interior en blanco y negro», imágenes PNG en gris sin pérdida. Si todo está en gris con las
-  fuentes incrustadas, el PDF sale PDF/X-1a:2001; si no, la app dice qué falta.
+  negro en gris puro y, con «Interior en blanco y negro», imágenes PNG en gris sin pérdida. Con «Pasar también los JPEG
+  a gris», las fotos JPEG en color también pasan a gris sin pérdida (se guardan píxel por píxel, sin volver a
+  comprimirlas como JPEG; el PDF pesa más). Si todo está en gris con las fuentes incrustadas, el PDF sale
+  PDF/X-1a:2001; si no, la app dice qué falta.
 
 ## Deploy
 

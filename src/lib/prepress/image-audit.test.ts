@@ -111,6 +111,8 @@ assert.equal(rotated.height, 30);
 assert.equal(iccInfo(rotated.icc!)?.description, "Adobe RGB (1998)");
 assert.equal(readJpeg(jpeg({ components: 4 }))?.adobe, false);
 assert.equal(readJpeg(jpeg({ components: 4, adobe: true }))?.adobe, true);
+assert.equal(readJpeg(jpeg({ components: 4, adobe: true }))?.adobeTransform, 2);
+assert.equal(readJpeg(jpeg({ components: 4 }))?.adobeTransform, null);
 const deep = readPng(await png(16, 6, adobeRgb))!;
 assert.equal(deep.bitDepth, 16);
 assert.equal(deep.alpha, true);

@@ -94,6 +94,8 @@ export type JpegInfo = {
   orientation: number;
   /** Marcador Adobe APP14: dice cómo están guardados los CMYK. */
   adobe: boolean;
+  /** El «transform» del marcador Adobe (0: RGB o CMYK tal cual; 1: YCbCr; 2: YCCK), o null si no lo tiene. */
+  adobeTransform: number | null;
   icc: Uint8Array | null;
 };
 
@@ -113,7 +115,7 @@ function exifOrientation(b: Uint8Array, tiff: number, end: number): number {
 
 export function readJpeg(bytes: Uint8Array): JpegInfo | null {
   if (sniffImage(bytes) !== "jpeg") return null;
-  const info: JpegInfo = { width: 0, height: 0, components: 0, precision: 8, orientation: 1, adobe: false, icc: null };
+  const info: JpegInfo = { width: 0, height: 0, components: 0, precision: 8, orientation: 1, adobe: false, adobeTransform: null, icc: null };
   const icc: Array<[number, Uint8Array]> = [];
   let p = 2;
   while (p + 4 <= bytes.length) {
@@ -137,7 +139,10 @@ export function readJpeg(bytes: Uint8Array): JpegInfo | null {
     if (length < 2 || end > bytes.length) break;
     if (marker === 0xe1 && ascii(bytes, start, 6) === "Exif\0\0") info.orientation = exifOrientation(bytes, start + 6, end);
     else if (marker === 0xe2 && ascii(bytes, start, 12) === "ICC_PROFILE\0") icc.push([bytes[start + 12] ?? 0, bytes.subarray(start + 14, end)]);
-    else if (marker === 0xee && ascii(bytes, start, 5) === "Adobe") info.adobe = true;
+    else if (marker === 0xee && ascii(bytes, start, 5) === "Adobe") {
+      info.adobe = true;
+      info.adobeTransform = start + 11 < end ? bytes[start + 11]! : null;
+    }
     else if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
       info.precision = bytes[start]!;
       info.height = u16(bytes, start + 1);

@@ -1,5 +1,20 @@
 import assert from "node:assert/strict";
-import { BLEED, compositeOnWhite, drawnNames, imagesOverPaint, type PaintOp, pressBoxes, rgbToGray } from "./export-pdf.ts";
+import jpeg from "jpeg-js";
+import * as lib from "pdf-lib";
+import {
+  BLEED,
+  compositeOnWhite,
+  decodeJpegRgb,
+  drawnNames,
+  fileSize,
+  imagesOverPaint,
+  jpegsToGray,
+  pageList,
+  type PaintOp,
+  prepareForPress,
+  pressBoxes,
+  rgbToGray,
+} from "./export-pdf.ts";
 
 // Sin sangrado ni marcas: todo es la página del Word.
 const plain = pressBoxes(0, 432, 648);
@@ -102,5 +117,145 @@ assert.deepEqual(
 // Los «Do» del contenido, en orden y con los nombres decodificados.
 assert.deepEqual(drawnNames("q 1 0 0 1 0 0 cm /Image-12-0 Do Q\nq /GS-1 gs /Im#20b Do Q /X Do"), ["Image-12-0", "Im b", "X"]);
 assert.deepEqual(drawnNames("BT <0012> Tj ET /Fx Dox"), []);
+
+// ---- Fotos JPEG en color → gris sin pérdida ----
+
+/** Un JPEG RGB real (degradé de colores) de w × h. */
+function colorJpeg(w: number, h: number, quality = 90): Uint8Array {
+  const data = new Uint8Array(w * h * 4);
+  for (let y = 0; y < h; y += 1) {
+    for (let x = 0; x < w; x += 1) {
+      const i = (y * w + x) * 4;
+      data[i] = Math.round((255 * x) / (w - 1));
+      data[i + 1] = Math.round((255 * y) / (h - 1));
+      data[i + 2] = 255 - data[i]!;
+      data[i + 3] = 255;
+    }
+  }
+  return new Uint8Array(jpeg.encode({ width: w, height: h, data }, quality).data);
+}
+
+/** Agrega un segmento APP14 «Adobe» con ese transform justo después del SOI. */
+function withAdobe(bytes: Uint8Array, transform: number): Uint8Array {
+  const payload = [0x41, 0x64, 0x6f, 0x62, 0x65, 0, 100, 0, 0, 0, 0, transform];
+  const segment = [0xff, 0xee, 0, payload.length + 2, ...payload];
+  return new Uint8Array([...bytes.subarray(0, 2), ...segment, ...bytes.subarray(2)]);
+}
+
+const photo = colorJpeg(64, 48);
+const decodedPhoto = (await decodeJpegRgb(photo))!;
+assert.equal(decodedPhoto.width, 64);
+assert.equal(decodedPhoto.height, 48);
+assert.equal(decodedPhoto.rgb.length, 64 * 48 * 3);
+// Lo mismo que jpeg-js con sus opciones normales: sin marcador Adobe es YCbCr.
+const plainDecode = jpeg.decode(photo, { useTArray: true, formatAsRGBA: false });
+assert.deepEqual(decodedPhoto.rgb, plainDecode.data);
+// El color se parece al original (un JPEG al 90 % no se aleja mucho).
+const corner = decodedPhoto.rgb.subarray((47 * 64 + 63) * 3, (47 * 64 + 63) * 3 + 3);
+assert.ok(Math.abs(corner[0]! - 255) < 24 && Math.abs(corner[1]! - 255) < 24 && corner[2]! < 24, `esquina: ${[...corner]}`);
+// Con marcador Adobe transform 1 (YCbCr) da lo mismo; con transform 0 los canales se leen tal cual (RGB).
+assert.deepEqual((await decodeJpegRgb(withAdobe(photo, 1)))!.rgb, decodedPhoto.rgb);
+const raw = (await decodeJpegRgb(withAdobe(photo, 0)))!.rgb;
+assert.deepEqual(raw, jpeg.decode(withAdobe(photo, 0), { useTArray: true, formatAsRGBA: false, colorTransform: false }).data);
+assert.notDeepEqual(raw, decodedPhoto.rgb);
+// Lo que no es un JPEG RGB de 8 bits no se decodifica.
+assert.equal(await decodeJpegRgb(new Uint8Array([1, 2, 3])), null);
+assert.equal(await decodeJpegRgb(photo.subarray(0, photo.length - 200)), null);
+
+/** Un PDF de dos páginas: la foto en la 1 y en un formulario de la 2, y otra foto distinta suelta en la 2. */
+async function photoPdf() {
+  const doc = await lib.PDFDocument.create();
+  const first = await doc.embedJpg(photo);
+  const second = await doc.embedJpg(colorJpeg(32, 32, 75));
+  const page1 = doc.addPage([200, 200]);
+  page1.drawImage(first, { x: 10, y: 10, width: 64, height: 48 });
+  const page2 = doc.addPage([200, 200]);
+  page2.drawImage(second, { x: 10, y: 10, width: 32, height: 32 });
+  // Un formulario (XObject Form) en la página 2 que usa la misma foto de la página 1.
+  const form = doc.context.formXObject([], {
+    BBox: [0, 0, 100, 100],
+    Resources: { XObject: { Fp: first.ref } },
+  });
+  const formRef = doc.context.register(form);
+  const resources = page2.node.Resources()!;
+  const objects = resources.lookup(lib.PDFName.of("XObject"), lib.PDFDict);
+  objects.set(lib.PDFName.of("Fx"), formRef);
+  // pdf-lib mete las fotos recién al guardar; en la app el PDF también llega ya guardado (de jsafa).
+  const loaded = await lib.PDFDocument.load(await doc.save({ useObjectStreams: false }));
+  return { doc: loaded, first: first.ref, second: second.ref };
+}
+
+const imageDict = (doc: lib.PDFDocument, ref: lib.PDFRef) => {
+  const stream = doc.context.lookup(ref);
+  assert.ok(stream instanceof lib.PDFRawStream);
+  return stream;
+};
+
+{
+  const { doc, first, second } = await photoPdf();
+  const before = imageDict(doc, first).contents.length + imageDict(doc, second).contents.length;
+  const done = await jpegsToGray(lib, doc);
+  assert.deepEqual([...done.pages], [1, 2]);
+  assert.equal(done.before, before);
+  for (const ref of [first, second]) {
+    const stream = imageDict(doc, ref);
+    assert.equal(stream.dict.get(lib.PDFName.of("ColorSpace"))?.toString(), "/DeviceGray");
+    assert.equal(stream.dict.get(lib.PDFName.of("Filter"))?.toString(), "/FlateDecode");
+    assert.equal(stream.dict.get(lib.PDFName.of("Subtype"))?.toString(), "/Image");
+  }
+  assert.ok(done.after > 0);
+  // Sin pérdida: el gris guardado es exactamente la luminancia de lo que se decodificó.
+  const gray = lib.decodePDFRawStream(imageDict(doc, first)).decode();
+  assert.deepEqual(gray, rgbToGray(decodedPhoto.rgb));
+  assert.equal(gray.length, 64 * 48);
+  // Ya en gris: prepareForPress no la cuenta como imagen en color.
+  const press = prepareForPress(lib, doc, true, true, true, new Set(), { jpegToGray: true });
+  assert.ok(!press.problems.some((p) => p.includes("color")), press.problems.join(" | "));
+  // Y el PDF se guarda y se vuelve a abrir.
+  const reopened = await lib.PDFDocument.load(await doc.save());
+  assert.equal(reopened.getPageCount(), 2);
+}
+
+{
+  // Sin la opción, la foto JPEG en color queda igual y la app sugiere encenderla.
+  const { doc, first } = await photoPdf();
+  const original = imageDict(doc, first).contents;
+  const press = prepareForPress(lib, doc, true, true, true);
+  assert.equal(imageDict(doc, first).contents, original);
+  assert.ok(press.problems.some((p) => p.includes("«Pasar también los JPEG a gris»")), press.problems.join(" | "));
+  // En color (sin blanco y negro) el aviso es el de siempre.
+  assert.ok(prepareForPress(lib, doc, false, true, true).problems.some((p) => p.includes("«Interior en blanco y negro»")));
+}
+
+{
+  // Lo que no se puede leer sin riesgo queda como estaba: CMYK, con Decode, un decodificador que no puede o que da otro tamaño.
+  const { doc, first, second } = await photoPdf();
+  imageDict(doc, first).dict.set(lib.PDFName.of("ColorSpace"), lib.PDFName.of("DeviceCMYK"));
+  imageDict(doc, second).dict.set(lib.PDFName.of("Decode"), doc.context.obj([0, 1, 0, 1, 0, 1]));
+  const done = await jpegsToGray(lib, doc);
+  assert.equal(done.pages.size, 0);
+  assert.equal(imageDict(doc, first).dict.get(lib.PDFName.of("Filter"))?.toString(), "/DCTDecode");
+  assert.equal(imageDict(doc, second).dict.get(lib.PDFName.of("Filter"))?.toString(), "/DCTDecode");
+}
+{
+  const { doc, first } = await photoPdf();
+  const fails = await jpegsToGray(lib, doc, async () => null);
+  assert.equal(fails.pages.size, 0);
+  const wrong = await jpegsToGray(lib, doc, async () => ({ width: 2, height: 2, rgb: new Uint8Array(12) }));
+  assert.equal(wrong.pages.size, 0);
+  assert.equal(imageDict(doc, first).dict.get(lib.PDFName.of("ColorSpace"))?.toString(), "/DeviceRGB");
+  // Con la opción encendida pero sin poder pasarla, el aviso lo dice.
+  const press = prepareForPress(lib, doc, true, true, true, new Set(), { jpegToGray: true });
+  assert.ok(press.problems.some((p) => p.includes("no se pudieron pasar a gris")), press.problems.join(" | "));
+}
+
+// Páginas y tamaños en palabras.
+assert.equal(pageList(new Set([2])), "página 2");
+assert.equal(pageList(new Set([9, 2, 5])), "páginas 2, 5, 9");
+assert.equal(pageList(new Set(Array.from({ length: 14 }, (_, i) => i + 1))), "páginas 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12…");
+assert.equal(fileSize(28751), "28 KB");
+assert.equal(fileSize(100), "1 KB");
+assert.equal(fileSize(2.5 * 1024 * 1024), "2,5 MB");
+assert.equal(fileSize(18.4 * 1024 * 1024), "18 MB");
 
 console.log("export-pdf ok");

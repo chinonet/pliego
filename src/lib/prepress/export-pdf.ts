@@ -6,6 +6,7 @@ import type {
   PDFPage as PDFPageType,
   PDFRef as PDFRefType,
 } from "pdf-lib";
+import { readJpeg } from "./image-audit.ts";
 import { clipCroppedImages } from "./prepare-export.ts";
 
 export type PdfExport = {
@@ -35,6 +36,11 @@ export type ExportOptions = {
    * que no tienen nada pintado debajo (un fondo de color, texto u otra imagen): esas se ven igual sobre el papel.
    */
   flatten?: boolean;
+  /**
+   * Con `grayscale`: las fotos JPEG en color también pasan a gris. Sin pérdida: se decodifican y el gris se guarda
+   * píxel por píxel (Flate), sin volver a comprimirlo como JPEG. El PDF pesa más.
+   */
+  jpegToGray?: boolean;
 };
 
 type PdfLib = typeof import("pdf-lib");
@@ -95,8 +101,12 @@ export async function exportPagesToPdf(
     }
   }
 
-  const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset, overPaint);
+  const jpegs = opts.grayscale && opts.jpegToGray ? await jpegsToGray(lib, merged) : null;
+  const found = prepareForPress(lib, merged, Boolean(opts.grayscale), Boolean(opts.flatten), opts.subset, overPaint, {
+    jpegToGray: Boolean(opts.jpegToGray),
+  });
   const problems = found.problems;
+  if (jpegs?.pages.size) found.notes.unshift(jpegNote(jpegs));
   shareFontPrograms(lib, merged);
   const pdfx = problems.length === 0;
   if (pdfx) declarePdfX1a(lib, merged, opts.title);
@@ -108,6 +118,121 @@ export async function exportPagesToPdf(
   // pdf-lib siempre escribe «%PDF-1.7»; PDF/X-1a:2001 pide 1.3. Mismo largo: no se corre ningún desplazamiento.
   setHeaderVersion(bytes, pdfx ? "1.3" : "1.4");
   return { bytes, pdfx, problems, needsSubset: found.wholeOtf && !opts.subset, notes: found.notes };
+}
+
+/** Un JPEG ya decodificado: RGB de 8 bits, fila por fila. */
+export type DecodedRgb = { width: number; height: number; rgb: Uint8Array };
+
+/**
+ * Decodifica un JPEG RGB como lo lee un visor de PDF: sin girarlo por la EXIF ni aplicarle el perfil de color (en el
+ * PDF va como DeviceRGB). Se usa jpeg-js y no el navegador: da lo mismo en todos los navegadores (algunos alteran los
+ * píxeles que se leen de un canvas, por privacidad) y se puede probar fuera del navegador. Si no puede, devuelve null.
+ */
+export async function decodeJpegRgb(bytes: Uint8Array): Promise<DecodedRgb | null> {
+  const info = readJpeg(bytes);
+  if (!info || info.components !== 3 || info.precision !== 8 || !info.width || !info.height) return null;
+  const jpeg = await import("jpeg-js");
+  const decode = jpeg.decode ?? (jpeg as unknown as { default: typeof jpeg }).default.decode;
+  try {
+    const image = decode(bytes, {
+      useTArray: true,
+      formatAsRGBA: false,
+      // Como en PDF: con marcador Adobe manda su «transform» (0 = RGB tal cual); sin marcador, YCbCr. jpeg-js por sí
+      // solo trata el transform 0 como YCbCr.
+      colorTransform: info.adobeTransform === null ? true : info.adobeTransform !== 0,
+      // Un JPEG dañado no se adivina: queda como estaba y la app avisa.
+      tolerantDecoding: false,
+      maxResolutionInMP: 250,
+      maxMemoryUsageInMB: 2048,
+    });
+    if (image.width !== info.width || image.height !== info.height) return null;
+    if (image.data.length !== image.width * image.height * 3) return null;
+    return { width: image.width, height: image.height, rgb: image.data };
+  } catch {
+    return null;
+  }
+}
+
+export type JpegsToGray = { pages: Set<number>; before: number; after: number };
+
+/**
+ * Pasa a gris, sin pérdida, cada foto JPEG RGB del PDF (también las que están dentro de un formulario): el gris por
+ * luminancia de cada píxel, guardado con Flate. Las que no se pueden leer quedan como estaban (y prepareForPress las
+ * informa). Devuelve las páginas tocadas y cuánto pesaban esas fotos antes y después.
+ */
+export async function jpegsToGray(
+  lib: PdfLib,
+  doc: PDFDocumentType,
+  decode: (bytes: Uint8Array) => Promise<DecodedRgb | null> = decodeJpegRgb,
+): Promise<JpegsToGray> {
+  const context = doc.context;
+  const seen = new Set<string>();
+  const result: JpegsToGray = { pages: new Set(), before: 0, after: 0 };
+  const visit = async (resources: PDFDictType | undefined, pageNumber: number) => {
+    const objects = resources ? asDict(lib, context, resources.get(lib.PDFName.of("XObject"))) : undefined;
+    for (const [, value] of objects?.entries() ?? []) {
+      if (!(value instanceof lib.PDFRef)) continue;
+      const key = value.toString();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const stream = context.lookup(value);
+      if (!(stream instanceof lib.PDFRawStream)) continue;
+      const subtype = nameOf(lib, context, stream.dict.get(lib.PDFName.of("Subtype")));
+      if (subtype === "Form") {
+        await visit(asDict(lib, context, stream.dict.get(lib.PDFName.of("Resources"))), pageNumber);
+        continue;
+      }
+      if (subtype !== "Image") continue;
+      const size = await jpegToGray(lib, context, value, decode);
+      if (!size) continue;
+      result.pages.add(pageNumber);
+      result.before += size[0];
+      result.after += size[1];
+      // Una foto grande tarda: se suelta el hilo para que la pantalla siga respondiendo.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  const pages = doc.getPages();
+  for (let i = 0; i < pages.length; i += 1) await visit(pages[i]!.node.Resources(), i + 1);
+  return result;
+}
+
+/** Una foto JPEG RGB → gris sin pérdida. Devuelve [bytes antes, bytes después], o null si no se tocó. */
+async function jpegToGray(
+  lib: PdfLib,
+  context: PDFContextType,
+  ref: PDFRefType,
+  decode: (bytes: Uint8Array) => Promise<DecodedRgb | null>,
+): Promise<[number, number] | null> {
+  const stream = context.lookup(ref);
+  if (!(stream instanceof lib.PDFRawStream)) return null;
+  const dict = stream.dict;
+  if (nameOf(lib, context, dict.get(lib.PDFName.of("Filter"))) !== "DCTDecode") return null;
+  // Un Decode o un DecodeParms cambian cómo se lee la foto: esas no se tocan.
+  if (dict.get(lib.PDFName.of("DecodeParms")) || dict.get(lib.PDFName.of("Decode"))) return null;
+  if (nameOf(lib, context, dict.get(lib.PDFName.of("ColorSpace"))) !== "DeviceRGB") return null;
+  if (numberOf(lib, context, dict.get(lib.PDFName.of("BitsPerComponent"))) !== 8) return null;
+  const width = numberOf(lib, context, dict.get(lib.PDFName.of("Width")));
+  const height = numberOf(lib, context, dict.get(lib.PDFName.of("Height")));
+  const decoded = await decode(stream.contents);
+  if (!decoded || decoded.width !== width || decoded.height !== height) return null;
+  if (decoded.rgb.length !== decoded.width * decoded.height * 3) return null;
+  const before = stream.contents.length;
+  dict.set(lib.PDFName.of("ColorSpace"), lib.PDFName.of("DeviceGray"));
+  replaceStream(lib, context, ref, dict, rgbToGray(decoded.rgb));
+  const next = context.lookup(ref);
+  return [before, next instanceof lib.PDFRawStream ? next.contents.length : before];
+}
+
+/** «340 KB», «2,4 MB», «18 MB». */
+export function fileSize(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  const mb = bytes / (1024 * 1024);
+  return `${mb < 10 ? mb.toFixed(1).replace(".", ",") : Math.round(mb)} MB`;
+}
+
+function jpegNote(done: JpegsToGray): string {
+  return `Las fotos JPEG en color (${pageList(done.pages)}) se pasaron a gris sin perder calidad, píxel por píxel: ahora ocupan ${fileSize(done.after)} en vez de ${fileSize(done.before)}.`;
 }
 
 export type Box = { x: number; y: number; width: number; height: number };
@@ -517,18 +642,21 @@ function wholeOpenTypeCff(lib: PdfLib, context: PDFContextType, font: PDFDictTyp
  * Deja el PDF listo para imprenta sin tocar el texto ni recomprimir fotos: neutros en gris, sin anotaciones y, en
  * blanco y negro, las imágenes sin pérdida pasadas a gris. Devuelve lo que impide declararlo PDF/X-1a.
  */
-function prepareForPress(
+export function prepareForPress(
   lib: PdfLib,
   doc: PDFDocumentType,
   grayscale: boolean,
   flatten: boolean,
   subset: boolean,
   overPaint: ReadonlySet<string> = new Set(),
+  extra: { jpegToGray?: boolean } = {},
 ): { problems: string[]; wholeOtf: boolean; notes: string[] } {
   const context = doc.context;
   const missingFonts = new Set<string>();
   const wholeOtf = new Set<string>();
   const colorImages = new Set<number>();
+  // Si alguna de esas no es una foto JPEG (la opción de los JPEG no la arreglaría).
+  let colorOther = false;
   const deepImages = new Set<number>();
   const maskedImages = new Set<number>();
   const coveredImages = new Set<number>();
@@ -580,7 +708,10 @@ function prepareForPress(
         const image = context.lookup(value);
         if (!(image instanceof lib.PDFRawStream)) continue;
         const space = nameOf(lib, context, image.dict.get(lib.PDFName.of("ColorSpace")));
-        if (space !== "DeviceGray" && space !== "DeviceCMYK") colorImages.add(pageNumber);
+        if (space !== "DeviceGray" && space !== "DeviceCMYK") {
+          colorImages.add(pageNumber);
+          if (nameOf(lib, context, image.dict.get(lib.PDFName.of("Filter"))) !== "DCTDecode") colorOther = true;
+        }
         // Hoy jsafa escribe siempre 8 bits (los PNG pasan por RGBA de 8 bits); se revisa por si eso cambia.
         const bits = numberOf(lib, context, image.dict.get(lib.PDFName.of("BitsPerComponent")));
         if (bits !== undefined && bits > 8) deepImages.add(pageNumber);
@@ -627,27 +758,31 @@ function prepareForPress(
   if (colorImages.size) {
     const pages = pageList(colorImages);
     problems.push(
-      grayscale
-        ? `Hay imágenes en color que no se pueden pasar a gris sin recomprimirlas (JPEG en color), en las páginas ${pages}. Pasalas a escala de grises en el Word.`
-        : `Hay imágenes en color RGB (páginas ${pages}). Si el interior es en blanco y negro, encendé «Interior en blanco y negro».`,
+      !grayscale
+        ? `Hay imágenes en color RGB (${pages}). Si el interior es en blanco y negro, encendé «Interior en blanco y negro».`
+        : extra.jpegToGray
+          ? `Hay imágenes en color que no se pudieron pasar a gris (${pages}): la app no las puede leer sin riesgo de cambiarlas. Pasalas a escala de grises en el Word.`
+          : !colorOther
+            ? `Hay fotos JPEG en color (${pages}). Encendé «Pasar también los JPEG a gris» o pasalas a escala de grises en el Word.`
+            : `Hay imágenes en color que no se pueden pasar a gris sin recomprimirlas (${pages}). Pasalas a escala de grises en el Word.`,
     );
   }
   if (colorVectors) problems.push("Hay texto o filetes en color.");
   if (deepImages.size) {
     problems.push(
-      `Hay imágenes de 16 bits por color (páginas ${pageList(deepImages)}), que PDF/X-1a no admite. Guardalas en 8 bits antes de ponerlas en el Word.`,
+      `Hay imágenes de 16 bits por color (${pageList(deepImages)}), que PDF/X-1a no admite. Guardalas en 8 bits antes de ponerlas en el Word.`,
     );
   }
   if (maskedImages.size) {
     problems.push(
       flatten
-        ? `Hay imágenes con transparencia que no se pudieron poner sobre blanco sin recomprimirlas (páginas ${pageList(maskedImages)}). Ponelas sobre fondo blanco en el Word.`
-        : `Hay imágenes con transparencia, por ejemplo un PNG con fondo transparente (páginas ${pageList(maskedImages)}), que PDF/X-1a no admite.`,
+        ? `Hay imágenes con transparencia que no se pudieron poner sobre blanco sin recomprimirlas (${pageList(maskedImages)}). Ponelas sobre fondo blanco en el Word.`
+        : `Hay imágenes con transparencia, por ejemplo un PNG con fondo transparente (${pageList(maskedImages)}), que PDF/X-1a no admite.`,
     );
   }
   if (coveredImages.size) {
     problems.push(
-      `Hay imágenes con fondo transparente encima de un color, un texto u otra imagen (páginas ${pageList(coveredImages)}). No se pusieron sobre blanco para no tapar lo de abajo, pero PDF/X-1a no admite esa transparencia: en el Word, usá una versión de la imagen con el fondo ya pintado.`,
+      `Hay imágenes con fondo transparente encima de un color, un texto u otra imagen (${pageList(coveredImages)}). No se pusieron sobre blanco para no tapar lo de abajo, pero PDF/X-1a no admite esa transparencia: en el Word, usá una versión de la imagen con el fondo ya pintado.`,
     );
   }
   if (opacity) {
@@ -657,7 +792,7 @@ function prepareForPress(
   const notes: string[] = [];
   if (flattenedImages.size) {
     notes.push(
-      `Las imágenes con fondo transparente (páginas ${pageList(flattenedImages)}) se pusieron sobre blanco, como pide PDF/X: no tenían nada debajo, así que en papel se ven igual.`,
+      `Las imágenes con fondo transparente (${pageList(flattenedImages)}) se pusieron sobre blanco, como pide PDF/X: no tenían nada debajo, así que en papel se ven igual.`,
     );
   }
   return { problems, wholeOtf: wholeOtf.size > 0, notes };
@@ -684,8 +819,10 @@ function dropAnnotations(lib: PdfLib, context: PDFContextType, page: PDFPageType
 }
 
 /** Las primeras 12 páginas de la lista, para el aviso. */
-function pageList(pages: Set<number>): string {
-  return [...pages].slice(0, 12).join(", ") + (pages.size > 12 ? "…" : "");
+/** «página 2» o «páginas 2, 5, 9» (hasta 12, después «…»). */
+export function pageList(pages: Set<number>): string {
+  const list = [...pages].sort((a, b) => a - b);
+  return (list.length === 1 ? "página " : "páginas ") + list.slice(0, 12).join(", ") + (list.length > 12 ? "…" : "");
 }
 
 function declarePdfX1a(lib: PdfLib, doc: PDFDocumentType, title: string) {

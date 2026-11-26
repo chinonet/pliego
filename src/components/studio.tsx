@@ -133,6 +133,7 @@ export function Studio() {
   const substitutesRef = useRef(true);
   const [cropMarks, setCropMarks] = useState(false);
   const [grayscale, setGrayscale] = useState(false);
+  const [jpegToGray, setJpegToGray] = useState(false);
   const [bleed, setBleed] = useState(false);
   const [press, setPress] = useState<{ pdfx: boolean; problems: string[]; notes: string[] } | null>(null);
   const [docWarnings, setDocWarnings] = useState<string[]>([]);
@@ -526,7 +527,11 @@ export function Studio() {
     // Una sola exportación a la vez: la segunda prepararía una página ya preparada.
     exportingRef.current = true;
     setExporting(true);
-    setStatus("Incrustando fuentes y pasando las imágenes tal cual");
+    setStatus(
+      grayscale && jpegToGray
+        ? "Incrustando fuentes y pasando las fotos a gris (puede tardar)"
+        : "Incrustando fuentes y pasando las imágenes tal cual",
+    );
     const previousFit = fit;
     flushSync(() => {
       setFit(false);
@@ -565,7 +570,7 @@ export function Studio() {
         unlock();
       };
       await registerShelfFonts(shelfRef.current, fontAliases(shelfRef.current, reportRef.current), embeddedRef.current);
-      const base = { title: stem(nameRef.current), cropMarks, grayscale, bleed, flatten: true };
+      const base = { title: stem(nameRef.current), cropMarks, grayscale, jpegToGray: grayscale && jpegToGray, bleed, flatten: true };
       let result: Awaited<ReturnType<typeof exportPagesToPdf>>;
       try {
         result = await exportPagesToPdf(sections, { ...base, subset: !fullFont });
@@ -728,8 +733,16 @@ export function Studio() {
               pressed={grayscale}
               onClick={() => setGrayscale((value) => !value)}
               label="Interior en blanco y negro"
-              hint="Para IngramSpark / Lightning Source en B/N: las imágenes PNG pasan a escala de grises sin perder calidad y el PDF sale PDF/X-1a. Los JPEG no se tocan."
+              hint="Para IngramSpark / Lightning Source en B/N: las imágenes PNG pasan a escala de grises sin perder calidad y el PDF sale PDF/X-1a. Las fotos JPEG quedan como están, salvo que enciendas la opción de abajo."
             />
+            {grayscale ? (
+              <Toggle
+                pressed={jpegToGray}
+                onClick={() => setJpegToGray((value) => !value)}
+                label="Pasar también los JPEG a gris"
+                hint="Las fotos JPEG en color pasan a escala de grises sin perder calidad: se guardan píxel por píxel, sin volver a comprimirlas como JPEG. Así el libro puede salir PDF/X-1a. Esas fotos ocupan más en el PDF (las de mucho detalle, varias veces más) y exportar tarda un poco más."
+              />
+            ) : null}
             <Toggle
               pressed={bleed}
               onClick={() => setBleed((value) => !value)}
