@@ -326,6 +326,8 @@ export function Studio() {
       if (paragraph.textContent?.trim() || !paragraph.querySelector("img, svg")) continue;
       const size = Number.parseFloat(getComputedStyle(paragraph.querySelector("span") ?? paragraph).fontSize) || 16;
       paragraph.style.lineHeight = "0";
+      paragraph.style.minHeight = "0";
+      for (const span of paragraph.querySelectorAll<HTMLElement>("span")) span.style.lineHeight = "0";
       paragraph.style.paddingBottom = `${(size * 0.222).toFixed(2)}px`;
     }
     const map = takeMarks(body);
