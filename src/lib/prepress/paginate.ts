@@ -1,5 +1,13 @@
 import { FOOTNOTE_MARK, MARK_CLOSE, MARK_OPEN, PAGES_MARK, SECTION_PAGES_MARK, type SectionNumbering } from "./fields.ts";
-import { DEFAULT_RENDER_INFO, type RenderInfo, type SectionLayout } from "./render-copy.ts";
+import {
+  BREAK_MARK,
+  DEFAULT_RENDER_INFO,
+  HEADER_ROW_MARK,
+  PROBE_MARK,
+  suppressesSpaceAfterManualBreak,
+  type RenderInfo,
+  type SectionLayout,
+} from "./render-copy.ts";
 
 const PAGE_SELECTOR = "section.docx";
 const NOTE_REF = "sup[data-pliego-note]";
@@ -7,6 +15,8 @@ const NOTE_REF = "sup[data-pliego-note]";
 export const CUSTOM_NOTE_MARK = `${MARK_OPEN}C${MARK_CLOSE}`;
 /** Puntos a píxeles CSS. */
 const PT = 96 / 72;
+/** Guion opcional: donde se corta el renglón se dibuja; al final de un bloque ya no. */
+const SHY = "­";
 
 function pagesOf(root: HTMLElement): HTMLElement[] {
   return [...root.querySelectorAll(PAGE_SELECTOR)] as HTMLElement[];
@@ -45,6 +55,29 @@ function isBlank(page: HTMLElement): boolean {
   return page.dataset.pliegoBlank !== undefined;
 }
 
+function blockCount(page: HTMLElement): number {
+  return childrenOf(page, "article").reduce((sum, article) => sum + article.children.length, 0);
+}
+
+function lastBlock(page: HTMLElement): HTMLElement | null {
+  const articles = childrenOf(page, "article").filter((article) => article.children.length > 0);
+  return (articles[articles.length - 1]?.lastElementChild as HTMLElement | null) ?? null;
+}
+
+/**
+ * Con varias partes de texto en la página (secciones continuas, notas finales), solo la última empuja hacia abajo las
+ * notas al pie y el pie de página; las otras quedan pegadas a la siguiente. No cambia cuánto entra en la página.
+ */
+function settleArticles(root: HTMLElement) {
+  for (const page of pagesOf(root)) {
+    const articles = childrenOf(page, "article");
+    articles.forEach((article, index) => {
+      const wanted = index === articles.length - 1 ? "" : "0px";
+      if (article.style.marginBottom !== wanted) article.style.marginBottom = wanted;
+    });
+  }
+}
+
 export type PageMap = {
   /** Sección de cada página. */
   section: Map<HTMLElement, number>;
@@ -52,6 +85,8 @@ export type PageMap = {
   first: Set<HTMLElement>;
   /** Encabezado y pie del Word para cada sección, según la página sea impar (0) o par (1). */
   templates: Map<number, Array<{ header: HTMLElement | null; footer: HTMLElement | null } | undefined>>;
+  /** Las notas finales, sacadas de la página de muestra: repaginate las pone al final del texto. */
+  endnotes: HTMLElement | null;
 };
 
 /** La llamada a nota que sigue a una marca: se saltean los textos que son solo marcas (o quedaron vacíos). */
@@ -63,14 +98,17 @@ function supAfter(node: Text): HTMLElement | null {
 }
 
 /**
- * Quita del texto las marcas de sección y de notas al pie, y anota de qué sección es cada página y qué encabezado y pie
- * le tocan (para repetirlos bien en las páginas que se agreguen).
+ * Quita del texto las marcas de sección, de notas al pie, de saltos manuales y de filas de título, y anota de qué
+ * sección es cada página y qué encabezado y pie le tocan (para repetirlos bien en las páginas que se agreguen). Las
+ * páginas de muestra (render-copy.ts) solo sirven para eso: se sacan, y las notas finales que el visor puso en la última
+ * quedan aparte hasta repaginate.
  */
 export function takeMarks(root: HTMLElement): PageMap {
   const pages = pagesOf(root);
   const section = new Map<HTMLElement, number>();
   const first = new Set<HTMLElement>();
   const starts = new Map<HTMLElement, number>();
+  const probes = new Set<HTMLElement>();
   const pattern = new RegExp(`${MARK_OPEN}S(\\d+)${MARK_CLOSE}`, "g");
   const nodes = markTexts(root);
   // Primero se buscan las llamadas (con las marcas todavía puestas) y después se limpia el texto.
@@ -84,30 +122,112 @@ export function takeMarks(root: HTMLElement): PageMap {
   }
   for (const node of nodes) {
     let text = node.nodeValue ?? "";
+    const page = node.parentElement?.closest<HTMLElement>(PAGE_SELECTOR) ?? null;
     for (const match of text.matchAll(pattern)) {
-      const page = pages.find((item) => item.contains(node));
       if (page && !starts.has(page)) starts.set(page, Number(match[1]));
     }
-    text = text.replace(pattern, "").split(FOOTNOTE_MARK).join("").split(CUSTOM_NOTE_MARK).join("");
-    node.nodeValue = text;
+    if (page && text.includes(PROBE_MARK)) probes.add(page);
+    if (text.includes(BREAK_MARK)) {
+      const paragraph = node.parentElement?.closest("p");
+      if (paragraph) paragraph.dataset.pliegoCont = "";
+    }
+    if (text.includes(HEADER_ROW_MARK)) {
+      const row = node.parentElement?.closest("tr");
+      if (row) row.dataset.pliegoHeader = "";
+    }
+    for (const mark of [FOOTNOTE_MARK, CUSTOM_NOTE_MARK, BREAK_MARK, HEADER_ROW_MARK, PROBE_MARK]) {
+      text = text.split(mark).join("");
+    }
+    node.nodeValue = text.replace(pattern, "");
   }
   // Una marca de nota propia sin su marca de nota común igual es una llamada (por si llegan en textos separados).
   for (const sup of root.querySelectorAll("sup[data-pliego-custom]")) (sup as HTMLElement).dataset.pliegoNote = "";
   const templates: PageMap["templates"] = new Map();
+  let endnotes: HTMLElement | null = null;
   let current = 0;
   pages.forEach((page, index) => {
     const begins = starts.get(page);
-    if (begins !== undefined) {
-      current = begins;
-      first.add(page);
+    if (begins !== undefined) current = begins;
+    if (probes.has(page)) {
+      // En las muestras no hay notas al pie: una lista ahí son las notas finales (el visor las pone en la última).
+      for (const list of childrenOf(page, "ol")) endnotes = list;
+    } else {
+      section.set(page, current);
+      // Cómo empieza la página: con la sección, o después de un salto de página manual (las de flow, «natural»).
+      page.dataset.pliegoBreak = begins !== undefined ? "section" : "manual";
+      if (begins !== undefined) first.add(page);
+      for (const article of childrenOf(page, "article")) article.dataset.pliegoSection = String(current);
     }
-    section.set(page, current);
-    if (first.has(page)) return;
+    if (begins !== undefined) return;
+    // Las páginas que no empiezan sección (las muestras incluidas) traen el encabezado y el pie común o de página par
+    // que eligió el visor según la paridad con que las dibujó.
     const slots = templates.get(current) ?? [];
     slots[index % 2] ??= { header: childrenOf(page, "header")[0] ?? null, footer: childrenOf(page, "footer")[0] ?? null };
     templates.set(current, slots);
   });
-  return { section, first, templates };
+  for (const page of probes) page.remove();
+  return { section, first, templates, endnotes };
+}
+
+/**
+ * Con «páginas por salto» el visor empieza una página en cada sección, también en las continuas. Como en Word, una
+ * sección continua sigue en la misma página que la anterior (si la hoja es del mismo tamaño): su texto y sus notas
+ * pasan a la página anterior. Va después de takeMarks y antes de repaginate. Devuelve cuántas páginas juntó.
+ */
+export function mergeContinuous(root: HTMLElement, map: PageMap, info: RenderInfo): number {
+  let merged = 0;
+  for (const page of pagesOf(root)) {
+    if (!map.first.has(page)) continue;
+    if (info.sections[map.section.get(page) ?? 0]?.type !== "continuous") continue;
+    const previous = page.previousElementSibling as HTMLElement | null;
+    if (!previous?.matches(PAGE_SELECTOR) || isBlank(previous)) continue;
+    if (previous.style.width !== page.style.width || previous.style.minHeight !== page.style.minHeight) continue;
+    const before = notesList(previous) ?? childrenOf(previous, "footer")[0] ?? null;
+    for (const article of childrenOf(page, "article")) previous.insertBefore(article, before);
+    const notes = notesList(page);
+    if (notes) {
+      const own = notesList(previous);
+      if (own) own.append(...[...notes.children]);
+      else previous.insertBefore(notes, childrenOf(previous, "footer")[0] ?? null);
+    }
+    map.section.delete(page);
+    map.first.delete(page);
+    page.remove();
+    merged += 1;
+  }
+  if (merged) settleArticles(root);
+  return merged;
+}
+
+/**
+ * Las notas finales van al final del texto de la última página, como en Word, una lista por nota (con su número) para
+ * que puedan seguir en las páginas siguientes de a una.
+ */
+function placeEndnotes(root: HTMLElement, map: PageMap) {
+  const list = map.endnotes as HTMLOListElement | null;
+  map.endnotes = null;
+  if (!list) return;
+  const pages = pagesOf(root).filter((page) => !isBlank(page));
+  const page = pages[pages.length - 1];
+  if (!page) return;
+  const article = root.ownerDocument.createElement("article");
+  article.className = "pliego-notas-finales";
+  article.dataset.pliegoSection = String(map.section.get(page) ?? 0);
+  const items = [...list.children] as HTMLElement[];
+  const start = Number.isFinite(list.start) ? list.start : 1;
+  items.forEach((item, index) => {
+    const one = list.cloneNode(false) as HTMLOListElement;
+    one.start = start + index;
+    // Entre una nota y la siguiente no hay más espacio que el de la propia nota.
+    if (index > 0) one.style.marginTop = "0px";
+    if (index < items.length - 1) one.style.marginBottom = "0px";
+    one.appendChild(item);
+    article.appendChild(one);
+  });
+  const articles = childrenOf(page, "article");
+  const last = articles[articles.length - 1];
+  if (last) last.after(article);
+  else page.insertBefore(article, notesList(page) ?? childrenOf(page, "footer")[0] ?? null);
 }
 
 /** Cambia el encabezado o el pie de una página por una copia del modelo. */
@@ -121,83 +241,315 @@ function swap(page: HTMLElement, tag: "header" | "footer", model: HTMLElement | 
   else page.append(copy);
 }
 
+/* ---------- Pasar lo que no entra a la página siguiente ---------- */
+
+/** La página nueva que recibe lo que no entra, con los lugares donde va cada cosa. */
+type Fresh = { page: HTMLElement; articles: Map<HTMLElement, HTMLElement>; notes: HTMLElement | null };
+
+function freshAfter(current: HTMLElement, map: PageMap): Fresh {
+  const page = current.cloneNode(false) as HTMLElement;
+  delete page.dataset.pliegoBlank;
+  // Empieza por un salto natural: como en Word, su primer párrafo no lleva el espacio anterior.
+  page.dataset.pliegoBreak = "natural";
+  const header = childrenOf(current, "header")[0];
+  const footer = childrenOf(current, "footer")[0];
+  if (header) page.appendChild(header.cloneNode(true));
+  if (footer) page.appendChild(footer.cloneNode(true));
+  current.after(page);
+  map.section.set(page, map.section.get(current) ?? 0);
+  return { page, articles: new Map(), notes: null };
+}
+
+/** La copia, en la página nueva, de la parte de texto de donde sale un bloque. */
+function targetFor(fresh: Fresh, source: HTMLElement): HTMLElement {
+  let target = fresh.articles.get(source);
+  if (!target) {
+    target = source.cloneNode(false) as HTMLElement;
+    fresh.articles.set(source, target);
+    const page = fresh.page;
+    const before = childrenOf(page, "article")[0] ?? childrenOf(page, "ol")[0] ?? childrenOf(page, "footer")[0];
+    page.insertBefore(target, before ?? null);
+  }
+  return target;
+}
+
+/** Las notas de las llamadas que se movieron son las últimas de la lista de esta página. */
+function moveNotes(current: HTMLElement, fresh: Fresh, count: number) {
+  const notes = notesList(current);
+  if (!count || !notes) return;
+  if (!fresh.notes) {
+    fresh.notes = notes.cloneNode(false) as HTMLElement;
+    fresh.page.insertBefore(fresh.notes, childrenOf(fresh.page, "footer")[0] ?? null);
+  }
+  fresh.notes.prepend(...[...notes.children].slice(-count));
+  if (!notes.children.length) notes.remove();
+}
+
+/** Saca las partes de texto que quedaron vacías (siempre queda al menos una). */
+function dropEmptyArticles(page: HTMLElement) {
+  const articles = childrenOf(page, "article");
+  const empty = articles.filter((article) => !article.children.length);
+  if (empty.length === articles.length) empty.shift();
+  for (const article of empty) article.remove();
+}
+
+/** Hasta dónde puede llegar el texto de una página que no entra (coordenadas de pantalla), y la escala de la vista. */
+function contentLimit(page: HTMLElement, height: number): { limit: number; k: number } | null {
+  const articles = childrenOf(page, "article").filter((article) => article.children.length > 0);
+  const last = articles[articles.length - 1];
+  if (!last || !(page.offsetHeight > 0)) return null;
+  const box = page.getBoundingClientRect();
+  if (!(box.height > 0)) return null;
+  const k = box.height / page.offsetHeight;
+  // Lo que va debajo del texto (notas, pie, margen) ocupa lo mismo cuando la página no entra en la hoja.
+  const below = box.bottom - last.getBoundingClientRect().bottom;
+  return { limit: box.top + height * k - below, k };
+}
+
+/**
+ * El último bloque que puede quedar en la página (índice, o -1 si ni el primero entra): su borde de abajo no pasa el
+ * límite, contando el lugar que liberan las notas de los bloques que se van. Los bordes crecen de arriba abajo (texto
+ * en una columna); refs da las llamadas a nota de cada bloque y relief(n) el lugar que dejan las últimas n notas.
+ */
+export function lastFitting(
+  count: number,
+  bottom: (index: number) => number,
+  refs: (index: number) => number,
+  totalRefs: number,
+  limit: number,
+  relief: (notes: number) => number,
+): number {
+  // Lo que está más abajo que el límite con todas las notas fuera no puede quedar: se busca a saltos.
+  const widest = limit + relief(totalRefs) + 0.5;
+  let lo = 0;
+  let hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (bottom(mid) > widest) hi = mid;
+    else lo = mid + 1;
+  }
+  let after = totalRefs;
+  for (let index = 0; index < lo; index += 1) after -= refs(index);
+  for (let index = lo - 1; index >= 0; index -= 1) {
+    if (bottom(index) <= limit + relief(Math.max(0, after)) + 0.5) return index;
+    after += refs(index);
+  }
+  return -1;
+}
+
+/**
+ * Los bloques que seguro no entran en la página, medidos de una sola vez: todos los que siguen al primero que no
+ * entra (ese queda, porque a lo mejor se parte). Con texto en columnas no se calcula (los bloques no van uno debajo
+ * del otro) y se pasan de a uno.
+ */
+function surelyOut(page: HTMLElement, height: number): HTMLElement[] {
+  const articles = childrenOf(page, "article").filter((article) => article.children.length > 0);
+  if (articles.some((article) => (Number.parseInt(getComputedStyle(article).columnCount, 10) || 1) > 1)) return [];
+  const blocks = articles.flatMap((article) => [...article.children] as HTMLElement[]);
+  if (blocks.length < 3) return [];
+  const area = contentLimit(page, height);
+  if (!area) return [];
+  const { limit, k } = area;
+  const notes = notesList(page);
+  const items = notes ? ([...notes.children] as HTMLElement[]) : [];
+  const relief = (n: number): number => {
+    if (!notes || n <= 0 || !items.length) return 0;
+    if (n >= items.length) {
+      const style = getComputedStyle(notes);
+      const margins = (Number.parseFloat(style.marginTop) || 0) + (Number.parseFloat(style.marginBottom) || 0);
+      return notes.getBoundingClientRect().height + margins * k;
+    }
+    return notes.getBoundingClientRect().bottom - items[items.length - n]!.getBoundingClientRect().top;
+  };
+  const counts = new Map<number, number>();
+  const refs = (index: number): number => {
+    let found = counts.get(index);
+    if (found === undefined) {
+      found = blocks[index]!.querySelectorAll(NOTE_REF).length;
+      counts.set(index, found);
+    }
+    return found;
+  };
+  // Cada llamada de la página tiene su nota en la lista: no hace falta recorrer todo el texto para contarlas.
+  const totalRefs = items.length;
+  const bottom = (index: number): number => {
+    const block = blocks[index]!;
+    return block.getBoundingClientRect().bottom + (Number.parseFloat(getComputedStyle(block).marginBottom) || 0) * k;
+  };
+  const keep = lastFitting(blocks.length, bottom, refs, totalRefs, limit, relief);
+  return blocks.slice(keep + 2);
+}
+
+/** Las filas de título del principio de la tabla (se repiten arriba en cada página). */
+function headerRows(table: HTMLTableElement): HTMLTableRowElement[] {
+  const out: HTMLTableRowElement[] = [];
+  for (const row of table.rows) {
+    if (row.dataset.pliegoHeader === undefined) break;
+    out.push(row);
+  }
+  return out;
+}
+
+/** Cuántas filas tienen que quedar arriba como mínimo: las de título y una más (si hay de título). */
+function minRows(table: HTMLTableElement): number {
+  const titles = headerRows(table).length;
+  return titles > 0 && titles < table.rows.length ? titles + 1 : 1;
+}
+
+function canSplit(page: HTMLElement): boolean {
+  const block = lastBlock(page);
+  if (!block) return false;
+  if (block.tagName === "P") return linesOf(block).length >= 4;
+  if (block.tagName === "TABLE") return (block as HTMLTableElement).rows.length > minRows(block as HTMLTableElement);
+  return false;
+}
+
+export type SpanCell = { row: number; col: number; span: number };
+
+/**
+ * Celdas combinadas en vertical que cruzan el corte de una tabla (las primeras «headRows» filas quedan arriba): cuántas
+ * filas de la combinación quedan arriba y cuántas siguen en la página nueva.
+ */
+export function spansAcross<T extends SpanCell>(cells: T[], headRows: number): Array<T & { keep: number; rest: number }> {
+  return cells
+    .filter((cell) => cell.span > 1 && cell.row < headRows && cell.row + cell.span > headRows)
+    .map((cell) => ({ ...cell, keep: headRows - cell.row, rest: cell.row + cell.span - headRows }));
+}
+
+/** Las celdas de una fila con su columna (contando las celdas ocultas de las combinaciones, como el visor). */
+function cellColumns(row: HTMLTableRowElement): Array<{ cell: HTMLTableCellElement; col: number }> {
+  const out: Array<{ cell: HTMLTableCellElement; col: number }> = [];
+  let col = 0;
+  for (const cell of row.cells) {
+    out.push({ cell, col });
+    col += Math.max(1, cell.colSpan);
+  }
+  return out;
+}
+
+/**
+ * El visor dibuja una celda combinada en vertical como una sola celda alta, y en las filas que siguen deja celdas
+ * ocultas. Si la tabla se corta a mitad de la combinación, arriba la celda se acorta y abajo la oculta de la primera
+ * fila pasa a ser la celda que sigue (si no, las celdas de esas filas se correrían una columna).
+ */
+function splitMerges(head: HTMLTableElement, tail: HTMLTableElement, offset: number) {
+  const first = tail.rows[offset];
+  if (!first) return;
+  const cells: Array<SpanCell & { cell: HTMLTableCellElement }> = [];
+  [...head.rows].forEach((row, index) => {
+    for (const { cell, col } of cellColumns(row)) {
+      if (cell.style.display !== "none") cells.push({ row: index, col, span: cell.rowSpan, cell });
+    }
+  });
+  const twins = cellColumns(first);
+  for (const item of spansAcross(cells, head.rows.length)) {
+    item.cell.rowSpan = item.keep;
+    const twin = twins.find((entry) => entry.col === item.col)?.cell;
+    if (twin && twin.style.display === "none") {
+      twin.style.display = "";
+      twin.rowSpan = item.rest;
+    }
+  }
+}
+
+/**
+ * Una tabla que no entra se parte por filas: las que sobran van a una copia de la tabla en la página nueva, con las
+ * filas de título repetidas arriba (como Word). Primero pasan de una vez las que seguro no entran.
+ */
+function splitTable(table: HTMLTableElement, page: HTMLElement, height: number, target: HTMLElement): HTMLTableElement {
+  const tail = table.cloneNode(false) as HTMLTableElement;
+  tail.removeAttribute("id");
+  for (const part of [...table.children]) if (part.tagName === "COLGROUP") tail.appendChild(part.cloneNode(true));
+  const keep = minRows(table);
+  const titles = keep > 1 ? headerRows(table) : [];
+  for (const row of titles) {
+    const copy = row.cloneNode(true) as HTMLTableRowElement;
+    // La repetición no lleva llamadas a nota: la nota ya va con la fila de arriba.
+    for (const sup of copy.querySelectorAll(NOTE_REF)) sup.remove();
+    copy.dataset.pliegoRepeat = "";
+    tail.appendChild(copy);
+  }
+  target.insertBefore(tail, target.firstChild);
+  let firstMoved: HTMLTableRowElement | null = null;
+  const area = contentLimit(page, height);
+  if (area) {
+    const rows = [...table.rows];
+    let lo = Math.max(0, keep - 1);
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (rows[mid]!.getBoundingClientRect().bottom > area.limit + 0.5) hi = mid;
+      else lo = mid + 1;
+    }
+    const out = rows.slice(lo + 1);
+    for (const row of out) tail.appendChild(row);
+    firstMoved = out[0] ?? null;
+  }
+  while (overflows(page, height) && table.rows.length > keep) {
+    const row = table.rows[table.rows.length - 1]!;
+    if (firstMoved) firstMoved.before(row);
+    else tail.appendChild(row);
+    firstMoved = row;
+  }
+  splitMerges(table, tail, titles.length);
+  return tail;
+}
+
 /**
  * Pasa a páginas nuevas lo que no entra en la hoja, igual que haría Word: se mueven párrafos o tablas enteros desde
- * el final, con sus notas al pie. Se puede llamar otra vez (después de cambiar márgenes): solo toca las páginas que
- * no entran. Devuelve cuántas páginas agregó y anota las que siguen sin entrar (un solo bloque más alto que la hoja).
+ * el final, con sus notas al pie, o se parten. Se puede llamar otra vez (después de cambiar márgenes): solo toca las
+ * páginas que no entran. Devuelve cuántas páginas agregó y anota las que siguen sin entrar (un solo bloque más alto que
+ * la hoja que no se puede partir).
  */
-function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>): number {
+function flow(root: HTMLElement, map: PageMap, tooTall: Set<HTMLElement>, info: RenderInfo): number {
   let added = 0;
   let page = root.querySelector(PAGE_SELECTOR) as HTMLElement | null;
   while (page) {
     const current = page;
-    suppressTopSpace(current);
+    suppressTopSpace(current, info);
     const height = sheetHeight(current);
-    const blocks = () => childrenOf(current, "article").reduce((sum, article) => sum + article.children.length, 0);
-    const lastBlock = () => {
-      const articles = childrenOf(current, "article").filter((article) => article.children.length > 0);
-      return (articles[articles.length - 1]?.lastElementChild as HTMLElement | null) ?? null;
-    };
-    const canSplit = () => {
-      const block = lastBlock();
-      return Boolean(block && ((block.tagName === "P" && linesOf(block).length >= 4) || (block.tagName === "TABLE" && (block as HTMLTableElement).rows.length > 1)));
-    };
-    if (overflows(current, height) && (blocks() > 1 || canSplit())) {
-      const fresh = current.cloneNode(false) as HTMLElement;
-      delete fresh.dataset.pliegoBlank;
-      const header = childrenOf(current, "header")[0];
-      const footer = childrenOf(current, "footer")[0];
-      if (header) fresh.appendChild(header.cloneNode(true));
-      if (footer) fresh.appendChild(footer.cloneNode(true));
-      current.after(fresh);
-      map.section.set(fresh, map.section.get(current) ?? 0);
+    if (overflows(current, height) && (blockCount(current) > 1 || canSplit(current))) {
+      const fresh = freshAfter(current, map);
       added += 1;
-      const freshArticles = new Map<HTMLElement, HTMLElement>();
-      let freshNotes: HTMLElement | null = null;
-      while (overflows(current, height) && (blocks() > 1 || canSplit())) {
-        const articles = childrenOf(current, "article").filter((article) => article.children.length > 0);
-        const source = articles[articles.length - 1]!;
-        let target = freshArticles.get(source);
-        if (!target) {
-          target = source.cloneNode(false) as HTMLElement;
-          freshArticles.set(source, target);
-          const before = childrenOf(fresh, "article")[0] ?? childrenOf(fresh, "ol")[0] ?? childrenOf(fresh, "footer")[0];
-          fresh.insertBefore(target, before ?? null);
+      // Lo que seguro no entra pasa de una vez (una sola medición); después se ajusta bloque por bloque.
+      const bulk = surelyOut(current, height);
+      if (bulk.length) {
+        let refs = 0;
+        for (let index = bulk.length - 1; index >= 0; index -= 1) {
+          const block = bulk[index]!;
+          refs += block.querySelectorAll(NOTE_REF).length;
+          const target = targetFor(fresh, block.parentElement as HTMLElement);
+          target.insertBefore(block, target.firstChild);
         }
-        const last = source.lastElementChild as HTMLElement;
-        let block: HTMLElement = last;
-        if (last.tagName === "TABLE" && (last as HTMLTableElement).rows.length > 1) {
-          // Una tabla que no entra se parte por filas: las que sobran van a una copia de la tabla en la página nueva.
-          const table = last as HTMLTableElement;
-          const tail = table.cloneNode(false) as HTMLTableElement;
-          tail.removeAttribute("id");
-          for (const part of [...table.children]) if (part.tagName === "COLGROUP") tail.appendChild(part.cloneNode(true));
-          target.insertBefore(tail, target.firstChild);
-          while (overflows(current, height) && table.rows.length > 1) {
-            const row = table.rows[table.rows.length - 1]!;
-            const firstRow = tail.rows[0];
-            if (firstRow) firstRow.before(row);
-            else tail.appendChild(row);
-          }
-          block = tail;
+        moveNotes(current, fresh, refs);
+        dropEmptyArticles(current);
+      }
+      while (overflows(current, height) && (blockCount(current) > 1 || canSplit(current))) {
+        const last = lastBlock(current)!;
+        const target = targetFor(fresh, last.parentElement as HTMLElement);
+        let block: HTMLElement;
+        if (last.tagName === "TABLE" && (last as HTMLTableElement).rows.length > minRows(last as HTMLTableElement)) {
+          block = splitTable(last as HTMLTableElement, current, height, target);
         } else {
           const tail = splitParagraph(last, current.offsetHeight - height);
+          // El único bloque de la página, que no se puede partir: queda (y la página se avisa como demasiado alta).
+          if (!tail && blockCount(current) === 1) break;
           block = tail ?? last;
           target.insertBefore(block, target.firstChild);
         }
-        // Las notas de las llamadas que se movieron son las últimas de la lista de esta página.
-        const moved = block.querySelectorAll(NOTE_REF).length;
-        const notes = notesList(current);
-        if (moved && notes) {
-          if (!freshNotes) {
-            freshNotes = notes.cloneNode(false) as HTMLElement;
-            fresh.insertBefore(freshNotes, childrenOf(fresh, "footer")[0] ?? null);
-          }
-          freshNotes.prepend(...[...notes.children].slice(-moved));
-          if (!notes.children.length) notes.remove();
-        }
-        const left = childrenOf(current, "article");
-        for (const article of left) if (!article.children.length && left.length > 1) article.remove();
+        moveNotes(current, fresh, block.querySelectorAll(NOTE_REF).length);
+        dropEmptyArticles(current);
+      }
+      if (blockCount(fresh.page) === 0) {
+        map.section.delete(fresh.page);
+        fresh.page.remove();
+        added -= 1;
+      } else {
+        dropEmptyArticles(fresh.page);
+        // La página nueva es de la sección de su primer texto (después de una sección continua puede ser otra).
+        const lead = childrenOf(fresh.page, "article").find((article) => article.children.length > 0);
+        const tagged = Number.parseInt(lead?.dataset.pliegoSection ?? "", 10);
+        if (Number.isFinite(tagged)) map.section.set(fresh.page, tagged);
       }
     }
     if (overflows(current, height)) tooTall.add(current);
@@ -254,11 +606,40 @@ function firstCharAt(block: HTMLElement, top: number): { node: Text; offset: num
   return null;
 }
 
+/** El carácter justo antes del corte (puede estar en el texto anterior), para ver si es un guion opcional. */
+function charBefore(block: HTMLElement, at: { node: Text; offset: number }): { node: Text; offset: number } | null {
+  if (at.offset > 0) return { node: at.node, offset: at.offset - 1 };
+  const walker = block.ownerDocument.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+  let previous: Text | null = null;
+  for (let node = walker.nextNode() as Text | null; node && node !== at.node; node = walker.nextNode() as Text | null) {
+    if (node.data.length) previous = node;
+  }
+  return previous ? { node: previous, offset: previous.data.length - 1 } : null;
+}
+
+/**
+ * Dónde empieza la segunda parte cuando el corte cae al principio de un texto: el elemento más alto del que ese texto
+ * es lo primero (una llamada a nota pasa entera, sin dejar arriba una copia vacía que se numeraría).
+ */
+function cutStart(block: HTMLElement, at: { node: Text; offset: number }): Node | null {
+  if (at.offset !== 0) return null;
+  const leads = (node: Node) => {
+    for (let sibling = node.previousSibling; sibling; sibling = sibling.previousSibling) {
+      if (!(sibling.nodeType === Node.TEXT_NODE && !(sibling as Text).data)) return false;
+    }
+    return true;
+  };
+  let node: Node = at.node;
+  while (node.parentNode && node.parentNode !== block && leads(node)) node = node.parentNode;
+  return node;
+}
+
 /**
  * Parte un párrafo en el renglón que cruza el pie de la hoja, como Word: quedan al menos dos renglones de cada lado
  * (viudas y huérfanas). La primera parte no lleva espacio después y, si es justificado, su último renglón también se
- * justifica; la segunda no repite la sangría, el espacio antes ni el número de lista. Devuelve la segunda parte, o null
- * si no conviene partirlo (entonces pasa entero).
+ * justifica; la segunda no repite la sangría, el espacio antes ni el número de lista. Si el renglón de arriba termina
+ * en un guion opcional, el guion queda escrito (al final del bloque ya no se dibujaría). Devuelve la segunda parte, o
+ * null si no conviene partirlo (entonces pasa entero).
  */
 function splitParagraph(block: HTMLElement, excess: number): HTMLElement | null {
   if (block.tagName !== "P") return null;
@@ -271,11 +652,16 @@ function splitParagraph(block: HTMLElement, excess: number): HTMLElement | null 
   if (keep < 2) return null;
   const at = firstCharAt(block, lines[keep]!.top);
   if (!at) return null;
+  const before = charBefore(block, at);
+  if (before && before.node.data[before.offset] === SHY) before.node.replaceData(before.offset, 1, "-");
   const range = block.ownerDocument.createRange();
-  range.setStart(at.node, at.offset);
+  const start = cutStart(block, at);
+  if (start) range.setStartBefore(start);
+  else range.setStart(at.node, at.offset);
   range.setEnd(block, block.childNodes.length);
   const tail = block.cloneNode(false) as HTMLElement;
   tail.removeAttribute("id");
+  delete tail.dataset.pliegoCont;
   tail.appendChild(range.extractContents());
   tail.classList.add("pliego-sigue");
   tail.style.textIndent = "0";
@@ -285,19 +671,42 @@ function splitParagraph(block: HTMLElement, excess: number): HTMLElement | null 
   return tail;
 }
 
-/** Como Word: el primer párrafo de la página no lleva el espacio anterior (un título de capítulo arranca en el margen). */
-function suppressTopSpace(page: HTMLElement) {
+/** Si el primer párrafo de una página lleva el espacio anterior, según cómo empieza la página. */
+export function keepsSpaceBefore(start: string | undefined, continuation: boolean, info: RenderInfo): boolean {
+  // La continuación de un párrafo que cortó un salto manual no es el comienzo del párrafo.
+  if (continuation) return false;
+  // Salto natural (la página la agregó la paginación).
+  if (start === "natural") return false;
+  if (start === "manual") return !suppressesSpaceAfterManualBreak(info);
+  // Comienzo de sección (o no se sabe): queda, como en Word.
+  return true;
+}
+
+/**
+ * Como Word: el primer párrafo de la página no lleva el espacio anterior después de un salto natural, ni (desde Word
+ * 2013) después de un salto manual. Al comienzo de una sección nueva queda (la caída de un título de capítulo).
+ */
+function suppressTopSpace(page: HTMLElement, info: RenderInfo) {
   const article = childrenOf(page, "article").find((item) => item.children.length > 0);
   const first = article?.firstElementChild as HTMLElement | null | undefined;
   if (!first || first.tagName !== "P" || first.style.marginTop === "0px") return;
+  if (keepsSpaceBefore(page.dataset.pliegoBreak, first.dataset.pliegoCont !== undefined, info)) return;
   if ((Number.parseFloat(getComputedStyle(first).marginTop) || 0) > 0) first.style.marginTop = "0px";
 }
 
-/** Cada página lleva el encabezado y el pie que le tocan por sección y por página par o impar. */
-function dress(root: HTMLElement, map: PageMap) {
+/**
+ * Cada página lleva el encabezado y el pie que le tocan por sección y por página par o impar. La primera página de
+ * una sección con «primera página distinta» queda con el de primera página que puso el visor.
+ */
+function dress(root: HTMLElement, map: PageMap, info: RenderInfo) {
   pagesOf(root).forEach((item, index) => {
-    if (map.first.has(item)) return;
-    const slots = map.templates.get(map.section.get(item) ?? 0);
+    const section = map.section.get(item) ?? 0;
+    if (map.first.has(item)) {
+      const layout = info.sections[section];
+      // Sin datos de la sección no se sabe si es primera página distinta: queda la que eligió el visor.
+      if (!layout || layout.titlePage) return;
+    }
+    const slots = map.templates.get(section);
     const model = slots?.[index % 2] ?? slots?.[(index + 1) % 2];
     if (!model) return;
     swap(item, "header", model.header);
@@ -312,15 +721,21 @@ function pageNumbers(root: HTMLElement, set: Set<HTMLElement>): number[] {
 
 /**
  * Lo que no entra en la hoja pasa a una página nueva, igual que haría Word: se mueven párrafos o tablas enteros desde
- * el final, con sus notas al pie. Después cada página lleva el encabezado y el pie que le tocan por sección y por
- * página par o impar. Devuelve las páginas que siguen sin entrar (un solo bloque más alto que la hoja).
+ * el final, con sus notas al pie, o se parten. Las notas finales van al final del texto. Después cada página lleva el
+ * encabezado y el pie que le tocan por sección y por página par o impar. Va después de takeMarks y mergeContinuous.
+ * Devuelve las páginas que siguen sin entrar (un solo bloque más alto que la hoja).
  */
-export function repaginate(root: HTMLElement, map: PageMap): { added: number; tooTall: number[] } {
+export function repaginate(
+  root: HTMLElement,
+  map: PageMap,
+  info: RenderInfo = DEFAULT_RENDER_INFO,
+): { added: number; tooTall: number[] } {
   const tooTall = new Set<HTMLElement>();
-  const added = flow(root, map, tooTall);
-  if (added) dress(root, map);
-  // Numeración común de Word (seguida desde 1); numberFootnotes la rehace con la del documento.
-  numberFootnotes(root, DEFAULT_RENDER_INFO, map);
+  placeEndnotes(root, map);
+  const added = flow(root, map, tooTall, info);
+  dress(root, map, info);
+  numberFootnotes(root, info, map);
+  settleArticles(root);
   return { added, tooTall: pageNumbers(root, tooTall) };
 }
 
@@ -370,13 +785,16 @@ function basePadding(page: HTMLElement): Padding {
   return pad;
 }
 
-function setMargins(root: HTMLElement, map: PageMap, info: RenderInfo) {
+/**
+ * La encuadernación ya viene sumada al margen en la copia para el visor (render-copy.ts): acá solo se invierten
+ * izquierda y derecha en las páginas pares con márgenes simétricos, que no cambia el ancho del texto.
+ */
+function setMargins(root: HTMLElement, info: RenderInfo) {
   const pages = pagesOf(root);
   // Se leen todos antes de escribir, para no medir a mitad de cambio.
   const bases = pages.map(basePadding);
   pages.forEach((page, index) => {
-    const layout = info.sections[map.section.get(page) ?? 0];
-    const pad = layoutPadding(bases[index]!, index, layout?.gutterPt ?? 0, info.mirrorMargins, info.gutterAtTop);
+    const pad = layoutPadding(bases[index]!, index, 0, info.mirrorMargins, info.gutterAtTop);
     page.style.paddingLeft = `${pad.left}px`;
     page.style.paddingRight = `${pad.right}px`;
     page.style.paddingTop = `${pad.top}px`;
@@ -487,9 +905,9 @@ export type LayoutResult = {
 };
 
 /**
- * Aplica lo que el visor no hace: márgenes simétricos, margen de encuadernación y secciones que empiezan en página
- * impar o par (con su página en blanco). Va después de repaginate y antes de numberPages. Al cambiar los márgenes el
- * texto se reacomoda, así que se vuelve a repaginar hasta que todo quede quieto.
+ * Aplica lo que el visor no hace: márgenes simétricos y secciones que empiezan en página impar o par (con su página
+ * en blanco). La encuadernación ya viene en los márgenes de la copia. Va después de repaginate y antes de numberPages.
+ * Al cambiar las páginas en blanco cambia qué página es par, así que se vuelve a mirar hasta que todo quede quieto.
  */
 export function applyLayout(
   root: HTMLElement,
@@ -499,17 +917,17 @@ export function applyLayout(
 ): LayoutResult {
   const warnings: string[] = [];
   const tooTall = new Set<HTMLElement>();
-  const needsMargins = info.mirrorMargins || info.sections.some((layout) => (layout.gutterPt ?? 0) > 0);
+  const needsMargins = info.mirrorMargins;
   const needsParity = info.sections.some((layout) => wantedParity(layout) !== null);
   let added = 0;
   if (needsMargins || needsParity) {
     let settled = false;
     for (let round = 0; round < 6 && !settled; round += 1) {
       const changed = needsParity ? placeBlanks(root, map, info, numbering) : false;
-      if (needsMargins) setMargins(root, map, info);
-      const more = flow(root, map, tooTall);
+      if (needsMargins) setMargins(root, info);
+      const more = flow(root, map, tooTall, info);
       added += more;
-      if (changed || more) dress(root, map);
+      if (changed || more) dress(root, map, info);
       // Una vuelta sin páginas nuevas ni cambios en las en blanco: listo.
       settled = !changed && !more;
     }
@@ -531,6 +949,7 @@ export function applyLayout(
       );
     }
   }
+  settleArticles(root);
   const blanks = pagesOf(root).filter(isBlank).length;
   return { added, blanks, tooTall: pageNumbers(root, tooTall), warnings };
 }

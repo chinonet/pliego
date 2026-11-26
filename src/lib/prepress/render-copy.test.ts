@@ -2,7 +2,17 @@ import assert from "node:assert/strict";
 import JSZip from "jszip";
 import { DOMParser, type Element as XmlElement } from "@xmldom/xmldom";
 import { FOOTNOTE_MARK, markPageFields } from "./fields.ts";
-import { cropToPercent, FOOTNOTE_CUSTOM_MARK, lengthToEmu, prepareRenderCopy } from "./render-copy.ts";
+import {
+  BREAK_MARK,
+  cropToPercent,
+  DEFAULT_RENDER_INFO,
+  FOOTNOTE_CUSTOM_MARK,
+  HEADER_ROW_MARK,
+  lengthToEmu,
+  prepareRenderCopy,
+  PROBE_MARK,
+  suppressesSpaceAfterManualBreak,
+} from "./render-copy.ts";
 
 const WNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const NS = [
@@ -32,13 +42,17 @@ const docXml = `${HEAD}<w:document ${NS}><w:body>
 <mc:Fallback><w:pict><v:shape style="width:100pt;height:50pt"><v:textbox><w:txbxContent><w:p><w:r><w:t>Recuadro</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>
 <w:p><w:r><w:t>Ventas</w:t></w:r><w:r><w:drawing><wp:inline><wp:extent cx="100" cy="100"/><a:graphic><a:graphicData><c:chart r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
 <w:p><w:pPr><w:sectPr><w:headerReference w:type="first" r:id="rId3"/><w:type w:val="continuous"/></w:sectPr></w:pPr><w:r><w:t>Capítulo</w:t></w:r></w:p>
-<w:p><w:r><w:t>Final</w:t></w:r></w:p>
+<w:p><w:r><w:t>Final</w:t><w:br w:type="page"/></w:r></w:p>
+<w:p><w:r><w:t>Antes</w:t><w:br w:type="page"/><w:t>Después del salto</w:t></w:r></w:p>
+<w:tbl><w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Título de tabla</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Dato</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
 <w:sectPr><w:footnotePr><w:numStart w:val="5"/></w:footnotePr><w:pgSz w:w="8640" w:h="12960"/></w:sectPr>
 </w:body></w:document>`;
 
 const settingsXml = `${HEAD}<w:settings ${NS}>
 <w:mirrorMargins/><w:gutterAtTop w:val="0"/><w:autoHyphenation w:val="true"/><w:evenAndOddHeaders/>
 <w:footnotePr><w:numRestart w:val="eachPage"/><w:numStart w:val="3"/></w:footnotePr>
+<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat>
 </w:settings>`;
 
 const relsXml = `${HEAD}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -76,7 +90,16 @@ assert.equal(info.autoHyphenation, true);
 assert.equal(info.footnoteRestart, "eachPage", "de settings");
 assert.equal(info.footnoteStart, 5, "el sectPr final manda sobre settings");
 assert.equal(info.sections.length, marked.sections.length, "las mismas secciones que fields.ts");
-assert.deepEqual(info.sections, [{ type: "oddPage", gutterPt: 18, leftPt: 72, rightPt: 54 }, { type: "continuous" }, {}]);
+assert.deepEqual(info.sections, [
+  { type: "oddPage", gutterPt: 18, leftPt: 72, rightPt: 54, titlePage: true },
+  { type: "continuous" },
+  {},
+]);
+assert.equal(info.compatibilityMode, 15);
+assert.equal(info.suppressSpBfAfterPgBrk, false);
+assert.equal(suppressesSpaceAfterManualBreak(info), true, "Word 2013 o posterior: sin espacio anterior después de un salto manual");
+assert.equal(suppressesSpaceAfterManualBreak(DEFAULT_RENDER_INFO), false);
+assert.equal(suppressesSpaceAfterManualBreak({ ...DEFAULT_RENDER_INFO, compatibilityMode: 14, suppressSpBfAfterPgBrk: true }), true);
 
 // Encabezados y pies vinculados al anterior
 const parsed = new DOMParser().parseFromString(body, "text/xml");
@@ -102,11 +125,31 @@ assert.match(rels, /Id="rIdPliegoBlankHeader"[^>]*Target="pliego-blank-header.xm
 assert.ok(out.file("word/pliego-blank-header.xml") && out.file("word/pliego-blank-footer.xml"), "partes vacías creadas");
 assert.match(await out.file("[Content_Types].xml")!.async("string"), /pliego-blank-footer\.xml/);
 
+// Encuadernación: con márgenes simétricos se suma al margen izquierdo (el interior) de la copia
+assert.match(body, /<w:pgMar w:top="1440" w:left="1800" w:right="1080" w:gutter="0"\/>/);
+
+// Páginas de muestra: dos por sección (pares e impares distintos), y el sectPr pasa a la última muestra
+assert.equal(body.split(PROBE_MARK).length - 1, 6);
+const sectionEnds = sectPrs.map((sectPr) => (sectPr.parentNode?.parentNode as XmlElement | null)?.textContent ?? "");
+assert.ok(sectionEnds[0]!.includes(PROBE_MARK) && sectionEnds[1]!.includes(PROBE_MARK), "cada sección termina en su muestra");
+assert.ok(body.indexOf("Fin de la portada") < body.indexOf(PROBE_MARK), "la muestra va después del texto de la sección");
+assert.ok(body.lastIndexOf(PROBE_MARK) < body.lastIndexOf("<w:sectPr>"), "las muestras de la última sección van antes del sectPr final");
+assert.equal(body.split("<w:pageBreakBefore/>").length - 1, 6);
+
+// Salto manual a mitad de párrafo: se marca lo que sigue; al final del párrafo no hace falta
+assert.ok(body.includes(`<w:br w:type="page"/><w:t xml:space="preserve">${BREAK_MARK}</w:t><w:t>Después del salto`));
+assert.equal(body.split(BREAK_MARK).length - 1, 1, "el salto al final de «Final» no lleva marca");
+
+// Fila de título de tabla: marca en su primera celda, después de las propiedades del párrafo
+assert.ok(body.includes(`<w:jc w:val="center"/></w:pPr><w:r><w:t xml:space="preserve">${HEADER_ROW_MARK}</w:t></w:r>`));
+assert.equal(body.split(HEADER_ROW_MARK).length - 1, 1, "la fila común no lleva marca");
+
 // Guiones
-assert.ok(body.includes("Anglo</w:t><w:t xml:space=\"preserve\">‑</w:t>"), "guion de no separación visible");
+assert.ok(body.includes("Anglo</w:t><w:t xml:space=\"preserve\">\u2060-\u2060</w:t>"), "guion de no separación: guion común que no corta");
 assert.ok(body.includes("­"), "guion opcional");
 assert.doesNotMatch(body, /noBreakHyphen|softHyphen/);
-assert.ok((await out.file("word/header2.xml")!.async("string")).includes("‑"), "también en encabezados");
+assert.ok((await out.file("word/header2.xml")!.async("string")).includes("\u2060-\u2060"), "también en encabezados");
+assert.ok(!body.includes("\u2011"), "sin U+2011, que falta en muchas fuentes");
 
 // Nota con símbolo propio: las dos marcas juntas, en el mismo texto, justo antes de la llamada
 assert.ok(body.includes(`${FOOTNOTE_MARK}${FOOTNOTE_CUSTOM_MARK}</w:t><w:footnoteReference w:customMarkFollows="1"`));
@@ -142,5 +185,7 @@ const plain = await prepareRenderCopy(await tiny.generateAsync({ type: "uint8arr
 assert.deepEqual(plain.info.sections, [{}]);
 assert.equal(plain.info.footnoteStart, 1);
 assert.deepEqual(plain.warnings, []);
+const plainBody = await (await JSZip.loadAsync(plain.bytes)).file("word/document.xml")!.async("string");
+assert.equal(plainBody.split(PROBE_MARK).length - 1, 1, "sin pares e impares distintos: una muestra (recibe las notas finales)");
 
 console.log("render-copy ok");

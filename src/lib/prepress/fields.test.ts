@@ -12,7 +12,9 @@ const docXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Capítulo 1</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
 <w:p><w:pPr><w:sectPr><w:pgNumType w:start="1"/></w:sectPr></w:pPr><w:r><w:t>Nota</w:t><w:footnoteReference w:id="1"/></w:r></w:p>
 <w:bookmarkStart w:id="0" w:name="x"/>
-<w:sdt><w:sdtContent><w:p><w:r><w:lastRenderedPageBreak/><w:t>Capítulo 2</w:t></w:r></w:p></w:sdtContent></w:sdt>
+<w:sdt><w:sdtContent><w:p><w:r><w:br w:type="page"/><w:t>Capítulo 2</w:t></w:r></w:p></w:sdtContent></w:sdt>
+<w:p><w:pPr><w:sectPr/></w:pPr><w:r><w:t>Fin del capítulo 2</w:t></w:r></w:p>
+<w:p><w:r><w:t>PRIMERA PARTE</w:t><w:br w:type="page"/><w:t>Capítulo 3</w:t></w:r></w:p>
 <w:sectPr/>
 </w:body></w:document>`;
 const footerXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -52,12 +54,17 @@ assert.deepEqual(marked.sections, [
   { start: undefined, format: "lowerRoman" },
   { start: 1, format: undefined },
   { start: undefined, format: undefined },
+  { start: undefined, format: undefined },
 ]);
 assert.ok(body.indexOf(sectionMark(0)) < body.indexOf("Prólogo"), "marca al comienzo de la primera sección");
 assert.ok(body.indexOf(sectionMark(1)) < body.indexOf("Capítulo 1"), "marca dentro de la tabla que abre la segunda sección");
 assert.ok(
-  body.indexOf("lastRenderedPageBreak") < body.indexOf(sectionMark(2)) && body.indexOf(sectionMark(2)) < body.indexOf("Capítulo 2"),
-  "la marca va después del salto guardado (y se encuentra aunque haya un marcador y un control de contenido antes)",
+  body.indexOf('w:type="page"') < body.indexOf(sectionMark(2)) && body.indexOf(sectionMark(2)) < body.indexOf("Capítulo 2"),
+  "la marca va después del salto (y se encuentra aunque haya un marcador y un control de contenido antes)",
+);
+assert.ok(
+  body.indexOf(sectionMark(3)) < body.indexOf("PRIMERA PARTE"),
+  "con texto antes del salto, la sección empieza con ese texto: la marca va al comienzo del párrafo",
 );
 assert.ok(body.indexOf(FOOTNOTE_MARK) < body.indexOf("footnoteReference"), "marca antes de la llamada a nota");
 assert.deepEqual(

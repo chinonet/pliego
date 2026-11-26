@@ -16,11 +16,13 @@ import { EMPTY_SPACING, prepareLineSpacing, type SpacingInfo } from "./line-spac
 export type SectionLayout = {
   /** Cómo empieza la sección (w:type del sectPr). Ausente = página siguiente. */
   type?: "nextPage" | "oddPage" | "evenPage" | "continuous" | "nextColumn";
-  /** Margen de encuadernación (w:gutter), en puntos. */
+  /** Margen de encuadernación (w:gutter), en puntos. En la copia para el visor ya va sumado al margen. */
   gutterPt?: number;
   /** Márgenes izquierdo y derecho del Word, en puntos. */
   leftPt?: number;
   rightPt?: number;
+  /** Primera página distinta (w:titlePg): la primera página de la sección lleva su propio encabezado y pie. */
+  titlePage?: boolean;
 };
 
 export type RenderInfo = {
@@ -37,6 +39,10 @@ export type RenderInfo = {
   sections: SectionLayout[];
   /** Interlineado y «sin espacio entre párrafos del mismo estilo», para la composición (line-spacing.ts). */
   spacing: SpacingInfo;
+  /** Modo de compatibilidad del Word (w:compatSetting compatibilityMode): 15 = Word 2013 o posterior; 0 = no lo dice. */
+  compatibilityMode: number;
+  /** «Suprimir espacio anterior después de un salto de página manual» (w:suppressSpBfAfterPgBrk). */
+  suppressSpBfAfterPgBrk: boolean;
 };
 
 export const DEFAULT_RENDER_INFO: RenderInfo = {
@@ -47,13 +53,32 @@ export const DEFAULT_RENDER_INFO: RenderInfo = {
   footnoteStart: 1,
   sections: [],
   spacing: EMPTY_SPACING,
+  compatibilityMode: 0,
+  suppressSpBfAfterPgBrk: false,
 };
+
+/**
+ * Como Word: después de un salto de página manual el primer párrafo de la página pierde el espacio anterior desde
+ * Word 2013 (modo de compatibilidad 15), o antes si el Word tiene activada esa opción.
+ */
+export function suppressesSpaceAfterManualBreak(info: RenderInfo): boolean {
+  return info.suppressSpBfAfterPgBrk || info.compatibilityMode >= 15;
+}
 
 /**
  * Va justo antes de la llamada de una nota con símbolo propio (w:customMarkFollows): el visor igual le pone número, y
  * el símbolo de verdad es el texto que sigue. Queda al final del mismo texto que la marca de nota de fields.ts.
  */
 export const FOOTNOTE_CUSTOM_MARK = `${MARK_OPEN}C${MARK_CLOSE}`;
+/** Justo después de un salto de página manual que corta un párrafo: lo que sigue es la continuación del párrafo. */
+export const BREAK_MARK = `${MARK_OPEN}B${MARK_CLOSE}`;
+/** En la primera celda de cada fila de título de una tabla (w:tblHeader): se repite si la tabla sigue en otra página. */
+export const HEADER_ROW_MARK = `${MARK_OPEN}H${MARK_CLOSE}`;
+/**
+ * Párrafo de muestra: cada sección termina con una o dos páginas de muestra (una impar y una par) que solo sirven para
+ * que el visor dibuje el encabezado y el pie comunes y de página par de la sección. Se sacan antes de paginar.
+ */
+export const PROBE_MARK = `${MARK_OPEN}Q${MARK_CLOSE}`;
 
 const W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -204,7 +229,29 @@ function readLayout(sectPr: XmlElement | undefined): SectionLayout {
     if (left !== undefined) layout.leftPt = left;
     if (right !== undefined) layout.rightPt = right;
   }
+  if (isOn(children(sectPr, "titlePg")[0])) layout.titlePage = true;
   return layout;
+}
+
+/**
+ * El visor lee el margen de encuadernación pero no lo aplica. Se suma en la copia al margen interior (el izquierdo; con
+ * márgenes simétricos el izquierdo es el interior) o al de arriba si el Word lo pide, así las páginas se llenan desde
+ * el principio con el ancho final. Después solo se invierten izquierda y derecha en las páginas pares, sin reacomodar.
+ */
+function bakeGutter(sectPr: XmlElement, info: RenderInfo): boolean {
+  const margins = children(sectPr, "pgMar")[0];
+  if (!margins) return false;
+  const gutter = twipsToPt(attr(margins, "gutter"));
+  if (gutter === undefined || gutter <= 0) return false;
+  const side = !info.mirrorMargins && info.gutterAtTop ? "top" : !attr(margins, "left") && attr(margins, "start") ? "start" : "left";
+  const raw = attr(margins, side);
+  const base = raw === "" ? 0 : twipsToPt(raw);
+  if (base === undefined) return false;
+  // Un margen de arriba negativo es fijo (el texto no se corre por el encabezado): se agranda igual, con su signo.
+  const value = (base < 0 ? base - gutter : base + gutter) * 20;
+  margins.setAttributeNS(W, `w:${side}`, String(Math.round(value)));
+  margins.setAttributeNS(W, "w:gutter", "0");
+  return true;
 }
 
 function readFootnotePr(props: XmlElement | undefined, info: RenderInfo) {
@@ -324,16 +371,111 @@ function addBlankParts(zip: JSZip, rels: XmlDocument, types: XmlDocument | null,
 
 // ——— Guiones y notas con símbolo propio ———
 
-/** El visor dibuja el guion de no separación como un punto de corte (no se ve) y el guion opcional no lo conoce. */
+/**
+ * El visor dibuja el guion de no separación como un punto de corte (no se ve) y el guion opcional no lo conoce. El de
+ * no separación pasa a un guion común entre dos «unión de palabras» (U+2060): se dibuja con el guion de la misma letra
+ * (U+2011 falta en muchas fuentes y en los subconjuntos que incrusta Word) y el renglón igual no se corta ahí.
+ */
 function fixHyphens(doc: XmlDocument): number {
   let count = 0;
-  for (const [name, text] of [["noBreakHyphen", "‑"], ["softHyphen", "­"]] as const) {
+  for (const [name, text] of [["noBreakHyphen", "\u2060-\u2060"], ["softHyphen", "\u00AD"]] as const) {
     for (const node of descendants(doc, name)) {
       node.parentNode?.replaceChild(newText(doc, text), node);
       count += 1;
     }
   }
   return count;
+}
+
+// ——— Marcas para la paginación: saltos manuales, filas de título y páginas de muestra ———
+
+/** Lo que se ve en un renglón (para saber si un salto de página manual deja algo después en el mismo párrafo). */
+const VISIBLE = new Set(["tab", "ptab", "drawing", "pict", "object", "sym", "noBreakHyphen", "footnoteReference", "endnoteReference"]);
+
+function isVisible(node: XmlElement): boolean {
+  const name = localName(node);
+  if (name === "t") return (node.textContent ?? "") !== "";
+  return VISIBLE.has(name);
+}
+
+/**
+ * Un salto de página manual a mitad de párrafo: el visor parte el párrafo y la segunda parte empieza la página con el
+ * espacio anterior del párrafo, que en Word no tiene (no es el comienzo del párrafo). Se marca lo que sigue al salto.
+ */
+function markManualBreaks(body: XmlElement): number {
+  let count = 0;
+  for (const paragraph of bodyBlocks(body)) {
+    if (localName(paragraph) !== "p") continue;
+    const all = Array.from(paragraph.getElementsByTagName("*")) as XmlElement[];
+    all.forEach((node, index) => {
+      if (localName(node) !== "br" || attr(node, "type") !== "page" || inChoice(node)) return;
+      if (!all.slice(index + 1).some(isVisible)) return;
+      const doc = node.ownerDocument;
+      if (!doc) return;
+      node.parentNode?.insertBefore(newText(doc, BREAK_MARK), node.nextSibling);
+      count += 1;
+    });
+  }
+  return count;
+}
+
+/** Las filas de título del principio de cada tabla (w:tblHeader) llevan una marca en su primera celda. */
+function markHeaderRows(doc: XmlDocument): number {
+  let count = 0;
+  for (const table of descendants(doc, "tbl")) {
+    if (inChoice(table)) continue;
+    for (const row of children(table, "tr")) {
+      const props = children(row, "trPr")[0];
+      if (!props || !isOn(children(props, "tblHeader")[0])) break;
+      const cell = children(row, "tc")[0];
+      const paragraph = cell ? children(cell, "p")[0] : undefined;
+      if (!paragraph) continue;
+      const run = doc.createElementNS(W, "w:r");
+      run.appendChild(newText(doc, HEADER_ROW_MARK));
+      const pPr = children(paragraph, "pPr")[0];
+      paragraph.insertBefore(run, pPr ? pPr.nextSibling : paragraph.firstChild);
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function probeParagraph(doc: XmlDocument): XmlElement {
+  const style = make(doc, W, "w:pStyle", { "w:val": "PliegoMuestra" });
+  const pPr = make(doc, W, "w:pPr", {}, [style, make(doc, W, "w:pageBreakBefore")]);
+  const run = make(doc, W, "w:r", {}, [newText(doc, PROBE_MARK)]);
+  return make(doc, W, "w:p", {}, [pPr, run]);
+}
+
+/**
+ * Al final de cada sección, una página de muestra (dos si hay encabezados distintos en páginas pares e impares, para
+ * que salga uno de cada uno). El visor arma una sola página por sección, con el encabezado de primera página si la
+ * sección lo tiene; de las muestras salen el encabezado y el pie de las páginas siguientes. La última de todas recibe
+ * además las notas finales. El sectPr pasa a la última muestra para que sigan dentro de su sección.
+ */
+function addProbes(doc: XmlDocument, sections: Array<XmlElement | undefined>, evenAndOdd: boolean): number {
+  const body = descendants(doc, "body")[0];
+  if (!body) return 0;
+  const count = evenAndOdd ? 2 : 1;
+  let added = 0;
+  for (const sectPr of sections) {
+    const probes = Array.from({ length: count }, () => probeParagraph(doc));
+    const props = sectPr?.parentNode as XmlElement | null | undefined;
+    const paragraph = props?.parentNode as XmlElement | null | undefined;
+    const parent = paragraph?.parentNode;
+    if (sectPr && props && paragraph && parent && localName(props) === "pPr") {
+      props.removeChild(sectPr);
+      children(probes[probes.length - 1]!, "pPr")[0]!.appendChild(sectPr);
+      const anchor = paragraph.nextSibling;
+      for (const probe of probes) parent.insertBefore(probe, anchor);
+    } else {
+      // La última sección: antes del sectPr final del cuerpo.
+      const last = children(body, "sectPr")[0] ?? null;
+      for (const probe of probes) body.insertBefore(probe, last);
+    }
+    added += probes.length;
+  }
+  return added;
 }
 
 function markCustomFootnotes(doc: XmlDocument): number {
@@ -596,6 +738,15 @@ export async function prepareRenderCopy(
     info.autoHyphenation = isOn(children(settingsRoot, "autoHyphenation")[0]);
     evenAndOdd = isOn(children(settingsRoot, "evenAndOddHeaders")[0]);
     readFootnotePr(children(settingsRoot, "footnotePr")[0], info);
+    const compat = children(settingsRoot, "compat")[0];
+    if (compat) {
+      info.suppressSpBfAfterPgBrk = isOn(children(compat, "suppressSpBfAfterPgBrk")[0]);
+      for (const setting of children(compat, "compatSetting")) {
+        if (attr(setting, "name") !== "compatibilityMode") continue;
+        const mode = Number.parseInt(attr(setting, "val"), 10);
+        if (Number.isFinite(mode)) info.compatibilityMode = mode;
+      }
+    }
   }
 
   const parts = Object.keys(zip.files).filter((name) => WHERE.some(([pattern]) => pattern.test(name)));
@@ -618,7 +769,11 @@ export async function prepareRenderCopy(
         zip.file(relsName, serialize(rels));
         if (types) zip.file("[Content_Types].xml", serialize(types));
       }
+      for (const sectPr of sections) if (sectPr) bakeGutter(sectPr, info);
       markCustomFootnotes(doc);
+      if (body) markManualBreaks(body);
+      markHeaderRows(doc);
+      addProbes(doc, sections, evenAndOdd);
       if (descendants(doc, "endnoteReference").some((ref) => isOnValue(attr(ref, "customMarkFollows")))) {
         warnings.push("Una nota final usa un símbolo propio en vez de número: en la vista previa puede salir también con número.");
       }
